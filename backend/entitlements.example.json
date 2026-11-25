@@ -1,0 +1,14 @@
+{
+  "users": {
+    "alice@example.com": {
+      "groups": ["Finance - EMEA", "Dashboard Hub Viewers"],
+      "user_attributes": {"region": "EMEA"},
+      "landing_page": "/dashboards/12"
+    },
+    "bob@example.com": {
+      "groups": ["Dashboard Hub Viewers"],
+      "landing_page": "/browse/boards/3"
+    }
+  },
+  "default": null
+}
