@@ -1,5 +1,7 @@
 # Looker (Google Cloud core) Just-in-Time (JIT) Provisioning
 
+**Language / Idioma:** English | [Español](README.es.md)
+
 End-to-end reference implementation for eliminating the blank first-login experience on **Looker (Google Cloud core)** when fine-grained BI groups and row-level security (RLS) cannot be mirrored inside corporate SAML/OIDC IdP claims.
 
 One unified codebase supports **two deployment profiles** tailored to segment size, networking, and governance requirements:
@@ -32,6 +34,8 @@ One unified codebase supports **two deployment profiles** tailored to segment si
 
 ```text
 looker-core-jit-provisioning/
+├── README.md                        # Primary documentation (English)
+├── README.es.md                     # Documentación principal (Español)
 ├── backend/                         # Zero-dependency Python 3.12+ unified backend
 │   ├── server.py                    # Multi-profile HTTP server (--profile smb|gate|worker|enterprise|all)
 │   ├── provisioner.py               # Fail-closed delta provisioner, pending marker, safe prefix revocation
