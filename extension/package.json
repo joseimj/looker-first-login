@@ -1,7 +1,7 @@
 {
-  "name": "provisioning-landing-extension",
-  "version": "0.1.0",
-  "description": "Looker landing extension that provisions a first-time user, then redirects.",
+  "name": "looker-jit-landing-extension",
+  "version": "1.0.0",
+  "description": "Dual-mode Looker landing extension for SMB (direct trigger) and Enterprise (zero-egress passive polling) JIT provisioning.",
   "private": true,
   "type": "module",
   "scripts": {

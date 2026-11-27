@@ -1,61 +1,92 @@
 /**
- * @fileoverview Settings of the landing extension. Edit, then rebuild.
- *
- * Every URL listed here must also appear in `external_api_urls` in the
- * LookML manifest, or Looker blocks the call.
+ * @fileoverview Dual-mode configuration for SMB and Enterprise profiles.
+ * Edit, then rebuild (`npm run build`).
  */
 
 export const CONFIG = Object.freeze({
-  /** Endpoint of the provisioning backend. */
+  /**
+   * Provisioning architecture mode:
+   *   'passive_poll' (Enterprise / Private IP / VPC-SC):
+   *     Uses manifest.enterprise.lkml with external_api_urls: [].
+   *     Cloud Logging -> Pub/Sub -> Cloud Tasks -> Worker provisions the user
+   *     privately inside GCP; the extension polls Looker's own sdk.me() with
+   *     backoff until the user's new group lands, then auto-redirects.
+   *   'direct' (SMB / Fast PoC):
+   *     Uses manifest.smb.lkml. The extension posts {user_id} to backendUrl
+   *     (via fetchProxy or serverProxy), then redirects immediately.
+   */
+  mode: 'passive_poll',
+
+  /* ---- Enterprise ('passive_poll') settings ---- */
+
+  /** Destination once provisioned (overridden if portal passes ?next=/...). */
+  hubPath: '/browse',
+
+  /**
+   * Optional explicit list of Looker group IDs (strings) that indicate the
+   * user is provisioned (e.g. your Dashboard Hub group ID). When empty, ANY
+   * group outside `ignoredGroupIds` and `pendingMarkerGroupId` triggers ready.
+   */
+  provisionedGroupIds: [],
+
+  /**
+   * Looker group IDs present on unprovisioned users (typically '1' for All
+   * Users plus your coarse SAML onboarding group ID).
+   */
+  ignoredGroupIds: ['1'],
+
+  /**
+   * Optional Looker group ID of `BI_Access_Pending_Approval`. When the Worker
+   * assigns this zero-privilege marker group, polling stops immediately and
+   * shows the "no dashboards assigned" screen (with optional request link).
+   */
+  pendingMarkerGroupId: '',
+
+  /** Optional self-service IGA / IT portal URL shown on the no_access screen. */
+  accessRequestUrl: '',
+
+  /**
+   * Jittered backoff schedule (ms) for passive_poll checks of sdk.me().
+   * Initial 2.5s delay aligns with typical Cloud Logging -> Worker latency so
+   * most first-time users resolve in 1–2 calls.
+   */
+  pollIntervalsMs: [2500, 4000, 7000, 12000, 20000],
+
+  /* ---- SMB ('direct') settings ---- */
+
+  /** Provisioning endpoint URL (must match manifest.smb.lkml). */
   backendUrl: 'http://localhost:8787/provision',
 
-  /**
-   * How the backend is reached:
-   *   'fetch'  - from the user's browser (extensionSDK.fetchProxy). The
-   *              backend must be reachable from the browser and allow the
-   *              Looker origin with CORS. Fits a backend on localhost or on
-   *              the corporate network.
-   *   'server' - from the Looker server (extensionSDK.serverProxy). The
-   *              backend must be reachable from the Looker instance. Allows
-   *              a shared secret that never reaches the browser.
-   */
+  /** 'fetch' (browser fetchProxy + CORS) or 'server' (Looker serverProxy). */
   transport: 'fetch',
 
-  /**
-   * 'server' transport only. Short name of the hidden Looker user attribute
-   * that holds the shared secret; empty to send none. With extension
-   * `provisioning_landing::splash` and the name `backend_secret`, the user
-   * attribute must be called `provisioning_landing_splash_backend_secret`.
-   */
+  /** 'server' transport only: scoped user attribute suffix for shared secret. */
   secretKeyName: '',
 
+  /** Retry settings for 'direct' mode. */
+  maxAttempts: 4,
+  retryDelayMs: 1500,
+  requestTimeoutMs: 15000,
+
+  /* ---- Shared redirect settings ---- */
+
   /**
-   * How the browser moves to the destination once access is granted:
-   *   'reload' - asks the Looker host to load the destination as a new page,
-   *              so that everything Looker cached in the page is rebuilt.
-   *   'spa'    - in-app navigation, without a page load.
-   * Only used when autoRedirect is true.
+   * How the browser transitions once access is ready:
+   *   'reload'  - page load via updateLocation(path, undefined, '_self')
+   *   'spa'     - in-app navigation via updateLocation(path)
+   *   'logout'  - redirects to /logout (use if Looker session caches groups
+   *               until re-login and SAML Bypass Login Page is enabled)
+   *   'new_tab' - opens target in a new tab via openBrowserWindow
    */
   redirectMode: 'reload',
 
   /**
-   * false: the splash screen stops once provisioning is done and offers one
-   *        button per redirect mode. This is the setting to start with: it
-   *        shows which mode gives the user working access.
-   * true:  the user is redirected at once with redirectMode. This is the
-   *        real first-login experience.
+   * false: pauses on ready with buttons for reload / SPA / logout / new tab
+   *        so you can verify which refreshes Looker permissions on your instance.
+   * true:  redirects automatically using redirectMode (production setting).
    */
   autoRedirect: false,
 
-  /** Calls to the backend before giving up and offering "Try again". */
-  maxAttempts: 4,
-
-  /** Wait before the second attempt; later attempts wait proportionally longer. */
-  retryDelayMs: 1500,
-
-  /** Longest time to wait for one answer from the backend. */
-  requestTimeoutMs: 15000,
-
-  /** Destination when the backend names none. */
+  /** Safe fallback when no other destination is configured or valid. */
   fallbackPath: '/browse',
 });

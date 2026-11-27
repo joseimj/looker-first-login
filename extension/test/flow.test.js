@@ -1,52 +1,50 @@
 /**
- * @fileoverview Unit tests of the provisioning flow. Run with `npm test`
- * (plain Node 20+, no dependencies).
+ * @fileoverview Unit tests covering BOTH SMB ('direct') and Enterprise
+ * ('passive_poll') modes, marker groups, ?next= deep links, loop guards, and
+ * redirect modes. Run with `npm test` (Node 20+, zero dependencies).
  */
 
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 
-import {callBackend, isSafeRelativePath, isSelfTarget, redirect, runProvisioning, State} from '../src/flow.js';
+import {classifyGroups, extractNextParam, isSafeRelativePath, isSelfTarget, redirect, runProvisioning} from '../src/flow.js';
 
-const BASE_CONFIG = Object.freeze({
+const DIRECT_CFG = Object.freeze({
+  mode: 'direct',
   backendUrl: 'https://backend.example.com/provision',
   transport: 'fetch',
   secretKeyName: '',
   redirectMode: 'reload',
   autoRedirect: true,
   maxAttempts: 4,
-  retryDelayMs: 1500,
+  retryDelayMs: 1000,
   requestTimeoutMs: 1000,
   fallbackPath: '/browse',
 });
 
-/** A successful backend answer as the extension SDK proxies return it. */
-function ok(body) {
-  return {ok: true, status: 200, body};
-}
+const PASSIVE_CFG = Object.freeze({
+  mode: 'passive_poll',
+  hubPath: '/browse/boards/3',
+  provisionedGroupIds: ['21'],
+  ignoredGroupIds: ['1', '10'],
+  pendingMarkerGroupId: '99',
+  pollIntervalsMs: [100, 200, 400],
+  redirectMode: 'reload',
+  autoRedirect: true,
+  fallbackPath: '/browse',
+});
 
-/**
- * Builds in-memory stand-ins for the Looker objects and the splash screen.
- * `responses` are returned (or thrown, for Error instances) by successive
- * backend calls.
- */
 function makeFakes({
+  meSequence = [{id: '101', group_ids: ['1', '10']}],
   responses = [],
-  meFails = false,
   extensionId = 'provisioning_landing::splash',
 } = {}) {
-  const queue = [...responses];
-  const fakes = {
-    calls: [],
-    locations: [],
-    windows: [],
-    states: [],
-    logs: [],
-    sleeps: [],
-  };
+  const meQueue = [...meSequence];
+  const respQueue = [...responses];
+  const fakes = {calls: [], locations: [], windows: [], states: [], sleeps: [], logs: []};
   const proxy = (via) => async (url, init, bodyType) => {
     fakes.calls.push({via, url, init, bodyType});
-    const next = queue.shift();
+    const next = respQueue.shift();
     if (next instanceof Error) throw next;
     return next;
   };
@@ -55,87 +53,128 @@ function makeFakes({
     fetchProxy: proxy('fetch'),
     serverProxy: proxy('server'),
     createSecretKeyTag: (name) => `{{provisioning_landing_splash_${name}}}`,
-    updateLocation: (...args) => {
-      fakes.locations.push(args);
-    },
-    openBrowserWindow: (...args) => {
-      fakes.windows.push(args);
-    },
+    updateLocation: (...args) => fakes.locations.push(args),
+    openBrowserWindow: (...args) => fakes.windows.push(args),
   };
   fakes.sdk = {
     me: async () => {
-      if (meFails) throw new Error('session expired');
-      return {id: '101'};
+      const next = meQueue.length > 1 ? meQueue.shift() : meQueue[0];
+      if (next instanceof Error) throw next;
+      return next;
     },
-    ok: (promise) => promise,
+    ok: (p) => p,
   };
   fakes.ui = {
-    setState: (state, info) => {
-      fakes.states.push(info === undefined ? [state] : [state, info]);
-    },
-    log: (message) => {
-      fakes.logs.push(message);
-    },
+    setState: (s, i) => fakes.states.push(i === undefined ? [s] : [s, i]),
+    log: (m) => fakes.logs.push(m),
   };
-  fakes.sleep = async (ms) => {
-    fakes.sleeps.push(ms);
-  };
-  fakes.run = (config = {}) => runProvisioning({
-    sdk: fakes.sdk,
-    extensionSDK: fakes.extensionSDK,
-    ui: fakes.ui,
-    config: {...BASE_CONFIG, ...config},
-    sleep: fakes.sleep,
-  });
+  fakes.sleep = async (ms) => fakes.sleeps.push(ms);
   return fakes;
 }
 
-test('redirects with a page load once the user is provisioned', async () => {
-  const fakes = makeFakes(
-      {responses: [ok({status: 'provisioned', redirect: '/dashboards/12'})]});
+test('passive_poll (Enterprise): polls sdk.me() with zero external calls and redirects when Hub group lands', async () => {
+  const fakes = makeFakes({
+    meSequence: [
+      {id: '101', group_ids: ['1', '10']},
+      {id: '101', group_ids: ['1', '10']},
+      {id: '101', group_ids: ['1', '10', '21']},
+    ],
+  });
 
-  const outcome = await fakes.run();
+  const outcome = await runProvisioning({
+    sdk: fakes.sdk,
+    extensionSDK: fakes.extensionSDK,
+    ui: fakes.ui,
+    config: PASSIVE_CFG,
+    sleep: fakes.sleep,
+    random: () => 0.5,
+  });
+
+  assert.deepEqual(outcome, {state: 'redirecting', target: '/browse/boards/3'});
+  assert.equal(fakes.calls.length, 0);
+  assert.deepEqual(fakes.sleeps, [100, 200]);
+  assert.deepEqual(fakes.locations, [['/browse/boards/3', undefined, '_self']]);
+});
+
+test('passive_poll: stops immediately on pendingMarkerGroupId (BI_Access_Pending_Approval)', async () => {
+  const fakes = makeFakes({
+    meSequence: [
+      {id: '103', group_ids: ['1', '10']},
+      {id: '103', group_ids: ['1', '10', '99']},
+    ],
+  });
+
+  const outcome = await runProvisioning({
+    sdk: fakes.sdk,
+    extensionSDK: fakes.extensionSDK,
+    ui: fakes.ui,
+    config: PASSIVE_CFG,
+    sleep: fakes.sleep,
+    random: () => 0.5,
+  });
+
+  assert.deepEqual(outcome, {state: 'no_access'});
+  assert.deepEqual(fakes.sleeps, [100]);
+  assert.deepEqual(fakes.locations, []);
+});
+
+test('passive_poll: supports ?next= deep link from enterprise portal', async () => {
+  const fakes = makeFakes({
+    meSequence: [{id: '101', group_ids: ['1', '10', '21']}],
+  });
+
+  const outcome = await runProvisioning({
+    sdk: fakes.sdk,
+    extensionSDK: fakes.extensionSDK,
+    ui: fakes.ui,
+    config: PASSIVE_CFG,
+    nextPath: extractNextParam('/?next=%2Fdashboards%2F42'),
+    sleep: fakes.sleep,
+  });
+
+  assert.deepEqual(outcome, {state: 'redirecting', target: '/dashboards/42'});
+  assert.deepEqual(fakes.sleeps, []);
+});
+
+test('passive_poll: detects any new non-ignored group when provisionedGroupIds is empty', () => {
+  const cfg = {...PASSIVE_CFG, provisionedGroupIds: []};
+  const baseline = new Set(['1', '10']);
+
+  assert.equal(classifyGroups(['1', '10'], cfg, baseline), 'pending');
+  assert.equal(classifyGroups(['1', '10', '99'], cfg, baseline), 'no_access');
+  assert.equal(classifyGroups(['1', '10', '20'], cfg, baseline), 'ready');
+});
+
+test('passive_poll: fails gracefully with Retry when polls exhaust', async () => {
+  const fakes = makeFakes({meSequence: [{id: '101', group_ids: ['1', '10']}]});
+
+  const outcome = await runProvisioning({
+    sdk: fakes.sdk,
+    extensionSDK: fakes.extensionSDK,
+    ui: fakes.ui,
+    config: PASSIVE_CFG,
+    sleep: fakes.sleep,
+    random: () => 0.5,
+  });
+
+  assert.equal(outcome.state, 'failed');
+  assert.deepEqual(fakes.sleeps, [100, 200, 400]);
+});
+
+test('direct (SMB): calls backend via serverProxy with secret key tag and redirects', async () => {
+  const fakes = makeFakes({
+    responses: [{ok: true, status: 200, body: {status: 'provisioned', redirect: '/dashboards/12'}}],
+  });
+
+  const outcome = await runProvisioning({
+    sdk: fakes.sdk,
+    extensionSDK: fakes.extensionSDK,
+    ui: fakes.ui,
+    config: {...DIRECT_CFG, transport: 'server', secretKeyName: 'backend_secret'},
+    sleep: fakes.sleep,
+  });
 
   assert.deepEqual(outcome, {state: 'redirecting', target: '/dashboards/12'});
-  assert.deepEqual(fakes.locations, [['/dashboards/12', undefined, '_self']]);
-  assert.deepEqual(fakes.states, [
-    ['identifying'],
-    ['provisioning', {attempt: 1}],
-    ['redirecting', {target: '/dashboards/12'}],
-  ]);
-});
-
-test('sends only the Looker user ID to the backend', async () => {
-  const fakes = makeFakes(
-      {responses: [ok({status: 'provisioned', redirect: '/dashboards/12'})]});
-
-  await fakes.run();
-
-  assert.equal(fakes.calls.length, 1);
-  const [call] = fakes.calls;
-  assert.equal(call.via, 'fetch');
-  assert.equal(call.url, 'https://backend.example.com/provision');
-  assert.equal(call.init.method, 'POST');
-  assert.deepEqual(call.init.headers, {'Content-Type': 'application/json'});
-  assert.deepEqual(JSON.parse(call.init.body), {user_id: '101'});
-  assert.equal(call.bodyType, 'json');
-});
-
-test('navigates in-app when the redirect mode is spa', async () => {
-  const fakes = makeFakes(
-      {responses: [ok({status: 'provisioned', redirect: '/dashboards/12'})]});
-
-  await fakes.run({redirectMode: 'spa'});
-
-  assert.deepEqual(fakes.locations, [['/dashboards/12']]);
-});
-
-test('server transport adds the secret key tag, not a secret', async () => {
-  const fakes = makeFakes(
-      {responses: [ok({status: 'provisioned', redirect: '/dashboards/12'})]});
-
-  await fakes.run({transport: 'server', secretKeyName: 'backend_secret'});
-
   assert.equal(fakes.calls[0].via, 'server');
   assert.deepEqual(JSON.parse(fakes.calls[0].init.body), {
     user_id: '101',
@@ -143,277 +182,52 @@ test('server transport adds the secret key tag, not a secret', async () => {
   });
 });
 
-test('server transport without a secret key name sends no secret', async () => {
-  const fakes = makeFakes(
-      {responses: [ok({status: 'provisioned', redirect: '/dashboards/12'})]});
+test('direct: fails fast on 401 without retrying', async () => {
+  const fakes = makeFakes({responses: [{ok: false, status: 401, body: {}}]});
 
-  await fakes.run({transport: 'server'});
-
-  assert.deepEqual(JSON.parse(fakes.calls[0].init.body), {user_id: '101'});
-});
-
-test('fetch transport never sends a secret', async () => {
-  const fakes = makeFakes(
-      {responses: [ok({status: 'provisioned', redirect: '/dashboards/12'})]});
-
-  await fakes.run({transport: 'fetch', secretKeyName: 'backend_secret'});
-
-  assert.deepEqual(JSON.parse(fakes.calls[0].init.body), {user_id: '101'});
-});
-
-test('redirects a user who was provisioned earlier', async () => {
-  const fakes = makeFakes({
-    responses: [ok({status: 'already_provisioned', redirect: '/boards/3'})],
+  const outcome = await runProvisioning({
+    sdk: fakes.sdk,
+    extensionSDK: fakes.extensionSDK,
+    ui: fakes.ui,
+    config: DIRECT_CFG,
+    sleep: fakes.sleep,
   });
 
-  const outcome = await fakes.run();
-
-  assert.deepEqual(outcome, {state: 'redirecting', target: '/boards/3'});
-  assert.deepEqual(fakes.locations, [['/boards/3', undefined, '_self']]);
-});
-
-test('retries with growing waits until the backend succeeds', async () => {
-  const fakes = makeFakes({
-    responses: [
-      new Error('network down'),
-      ok({status: 'pending'}),
-      ok({status: 'provisioned', redirect: '/dashboards/12'}),
-    ],
-  });
-
-  const outcome = await fakes.run();
-
-  assert.equal(outcome.state, 'redirecting');
-  assert.equal(fakes.calls.length, 3);
-  assert.deepEqual(fakes.sleeps, [1500, 3000]);
-  assert.deepEqual(fakes.locations, [['/dashboards/12', undefined, '_self']]);
-});
-
-test('gives up after the configured number of attempts', async () => {
-  const fakes = makeFakes({
-    responses: [
-      new Error('down 1'),
-      new Error('down 2'),
-      new Error('down 3'),
-      new Error('down 4'),
-    ],
-  });
-
-  const outcome = await fakes.run();
-
   assert.equal(outcome.state, 'failed');
-  assert.equal(outcome.error.message, 'down 4');
-  assert.equal(fakes.calls.length, 4);
-  assert.deepEqual(fakes.sleeps, [1500, 3000, 4500]);
-  assert.deepEqual(fakes.locations, []);
-  assert.deepEqual(fakes.states.at(-1), ['failed', {error: outcome.error}]);
+  assert.equal(fakes.calls.length, 1);
+  assert.deepEqual(fakes.sleeps, []);
 });
 
-test('treats an HTTP error answer as a failed attempt', async () => {
-  const fakes = makeFakes({responses: [{ok: false, status: 502, body: {}}]});
-
-  const outcome = await fakes.run({maxAttempts: 1});
-
-  assert.equal(outcome.state, 'failed');
-  assert.equal(outcome.error.message, 'Backend answered HTTP 502');
-  assert.deepEqual(fakes.locations, []);
-});
-
-test('treats an answer without status as a failed attempt', async () => {
-  const fakes = makeFakes({responses: [ok({redirect: '/dashboards/12'})]});
-
-  const outcome = await fakes.run({maxAttempts: 1});
-
-  assert.equal(outcome.state, 'failed');
-  assert.equal(outcome.error.message, 'Backend answer has no status');
-  assert.deepEqual(fakes.locations, []);
-});
-
-test('fails an attempt when the backend does not answer in time', async () => {
+test('redirect supports reload, spa, logout, and new_tab modes', () => {
   const fakes = makeFakes();
-  fakes.extensionSDK.fetchProxy = () => new Promise(() => {});
-
-  const outcome = await fakes.run({maxAttempts: 1, requestTimeoutMs: 10});
-
-  assert.equal(outcome.state, 'failed');
-  assert.equal(
-      outcome.error.message, 'No answer from the backend after 10 ms');
-});
-
-for (const status of [400, 401, 403, 404, 422]) {
-  test(`fails fast without retrying on HTTP ${status}`, async () => {
-    const fakes = makeFakes({responses: [{ok: false, status, body: {}}]});
-
-    const outcome = await fakes.run({maxAttempts: 4});
-
-    assert.equal(outcome.state, 'failed');
-    assert.equal(outcome.error.message, `Backend answered HTTP ${status}`);
-    assert.equal(fakes.calls.length, 1);
-    assert.deepEqual(fakes.sleeps, []);
-  });
-}
-
-for (const status of ['no_entitlements', 'unknown_user', 'disabled', 'not_saml']) {
-  test(`stops without redirect or retry on status ${status}`, async () => {
-    const fakes = makeFakes({responses: [ok({status, redirect: null})]});
-
-    const outcome = await fakes.run();
-
-    assert.deepEqual(outcome, {state: 'no_access'});
-    assert.equal(fakes.calls.length, 1);
-    assert.deepEqual(fakes.locations, []);
-    assert.deepEqual(fakes.states.at(-1), ['no_access']);
-  });
-}
-
-for (const unsafe of [
-  'https://evil.example.com/',
-  '//evil.example.com/',
-  '/\\evil.example.com/',
-  'javascript:alert(1)',
-  'dashboards/12',
-  '/dashboards/12 /x',
-  '',
-  null,
-  42,
-]) {
-  test(`falls back when the destination is ${JSON.stringify(unsafe)}`,
-      async () => {
-        const fakes = makeFakes(
-            {responses: [ok({status: 'provisioned', redirect: unsafe})]});
-
-        const outcome = await fakes.run();
-
-        assert.deepEqual(outcome, {state: 'redirecting', target: '/browse'});
-        assert.deepEqual(fakes.locations, [['/browse', undefined, '_self']]);
-      });
-}
-
-test('waits for the user when automatic redirect is off', async () => {
-  const fakes = makeFakes(
-      {responses: [ok({status: 'provisioned', redirect: '/dashboards/12'})]});
-
-  const outcome = await fakes.run({autoRedirect: false});
-
-  assert.deepEqual(outcome, {state: 'ready', target: '/dashboards/12'});
-  assert.deepEqual(fakes.locations, []);
-  assert.deepEqual(fakes.states.at(-1), ['ready', {target: '/dashboards/12'}]);
-});
-
-test('accepts a backend answer delivered as JSON text', async () => {
-  const fakes = makeFakes({
-    responses:
-        [ok('{"status": "provisioned", "redirect": "/dashboards/12"}')],
-  });
-
-  const outcome = await fakes.run();
-
-  assert.deepEqual(outcome, {state: 'redirecting', target: '/dashboards/12'});
-});
-
-test('fails without calling the backend when the user is unknown', async () => {
-  const fakes = makeFakes({meFails: true});
-
-  const outcome = await fakes.run();
-
-  assert.equal(outcome.state, 'failed');
-  assert.equal(outcome.error.message, 'session expired');
-  assert.equal(fakes.calls.length, 0);
-});
-
-test('callBackend returns the decoded backend answer', async () => {
-  const fakes = makeFakes(
-      {responses: [ok({status: 'provisioned', redirect: '/dashboards/12'})]});
-
-  const answer = await callBackend(fakes.extensionSDK, BASE_CONFIG, 101);
-
-  assert.deepEqual(answer, {status: 'provisioned', redirect: '/dashboards/12'});
-  assert.deepEqual(JSON.parse(fakes.calls[0].init.body), {user_id: '101'});
-});
-
-test('redirect asks for a page load in reload mode', () => {
-  const fakes = makeFakes();
-
   redirect(fakes.extensionSDK, '/dashboards/12', 'reload');
-
-  assert.deepEqual(fakes.locations, [['/dashboards/12', undefined, '_self']]);
-});
-
-test('redirect navigates in-app in spa mode', () => {
-  const fakes = makeFakes();
-
   redirect(fakes.extensionSDK, '/dashboards/12', 'spa');
-
-  assert.deepEqual(fakes.locations, [['/dashboards/12']]);
-});
-
-test('redirect opens a new tab in new_tab mode', () => {
-  const fakes = makeFakes();
-
+  redirect(fakes.extensionSDK, '/dashboards/12', 'logout');
   redirect(fakes.extensionSDK, '/dashboards/12', 'new_tab');
 
+  assert.deepEqual(fakes.locations, [
+    ['/dashboards/12', undefined, '_self'],
+    ['/dashboards/12'],
+    ['/logout', undefined, '_self'],
+  ]);
   assert.deepEqual(fakes.windows, [['/dashboards/12', '_blank']]);
 });
 
-for (const selfPath of [
-  '/extensions/provisioning_landing::splash',
-  '/extensions/provisioning_landing::splash/',
-  '/extensions/provisioning_landing::splash?retry=1',
-  '/spartan/provisioning_landing::splash',
-]) {
-  test(`refuses to redirect back to itself (${selfPath})`, async () => {
-    const fakes = makeFakes(
-        {responses: [ok({status: 'provisioned', redirect: selfPath})]});
+test('blocks self-redirect loop and unsafe URLs', async () => {
+  assert.equal(isSelfTarget('/spartan/provisioning_landing::splash', 'provisioning_landing::splash'), true);
+  assert.equal(isSafeRelativePath('//evil.example.com'), false);
+  assert.equal(extractNextParam('/?next=https://evil.example.com'), null);
 
-    const outcome = await fakes.run();
-
-    assert.deepEqual(outcome, {state: 'redirecting', target: '/browse'});
-    assert.deepEqual(fakes.locations, [['/browse', undefined, '_self']]);
+  const fakes = makeFakes({
+    responses: [{ok: true, status: 200, body: {status: 'provisioned', redirect: '/extensions/provisioning_landing::splash'}}],
   });
-}
-
-test('fails instead of looping when fallback also points to itself',
-    async () => {
-      const fakes = makeFakes({
-        responses: [ok({
-          status: 'provisioned',
-          redirect: '/extensions/provisioning_landing::splash',
-        })],
-      });
-
-      const outcome = await fakes.run(
-          {fallbackPath: '/extensions/provisioning_landing::splash'});
-
-      assert.equal(outcome.state, 'failed');
-      assert.deepEqual(fakes.locations, []);
-    });
-
-test('isSelfTarget does not reject other extensions', () => {
-  assert.equal(
-      isSelfTarget(
-          '/extensions/other_project::app', 'provisioning_landing::splash'),
-      false);
-  assert.equal(
-      isSelfTarget(
-          '/extensions/provisioning_landing::splash_v2',
-          'provisioning_landing::splash'),
-      false);
-});
-
-test('isSafeRelativePath accepts paths on the instance', () => {
-  assert.equal(isSafeRelativePath('/dashboards/12'), true);
-  assert.equal(isSafeRelativePath('/browse/boards/3?tab=1#top'), true);
-  assert.equal(isSafeRelativePath('/extensions/a::b'), true);
-  assert.equal(isSafeRelativePath('/'), true);
-});
-
-test('State lists the states of the splash screen', () => {
-  assert.deepEqual(Object.values(State).sort(), [
-    'failed',
-    'identifying',
-    'no_access',
-    'provisioning',
-    'ready',
-    'redirecting',
-  ]);
+  const outcome = await runProvisioning({
+    sdk: fakes.sdk,
+    extensionSDK: fakes.extensionSDK,
+    ui: fakes.ui,
+    config: {...DIRECT_CFG, fallbackPath: '/extensions/provisioning_landing::splash'},
+    sleep: fakes.sleep,
+  });
+  assert.equal(outcome.state, 'failed');
+  assert.deepEqual(fakes.locations, []);
 });

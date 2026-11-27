@@ -1,166 +1,97 @@
-# Errors, Caveats, and Production Readiness Checklist
+# Production Caveats & Troubleshooting
 
-Review these caveats before running the PoC and before scaling this pattern to
-production.
+Review every item in this guide before deploying to staging or production.
 
-## 1. Two behaviors the PoC must verify first
+---
 
-Neither behavior is explicitly guaranteed in the Looker documentation. Run
-**Stage 0** in the [README](../README.md) on a test instance before investing in
-production plumbing:
+## 1. Critical Looker Core Platform Caveats
 
-1.  **`landing_page` on the very first SAML login.** Confirm that a brand-new
-    SAML user lands on the coarse group's `landing_page` immediately on first
-    authentication (before any second login).
-2.  **Live session refresh after `add_group_user`.** Confirm whether the user's
-    existing browser session sees newly granted folders/roles after:
-    *   in-app navigation (`extensionSDK.updateLocation(target)`),
-    *   a full page load (`extensionSDK.updateLocation(target, undefined, '_self')`),
-    *   a new tab (`extensionSDK.openBrowserWindow(target, '_blank')`), or
-    *   only after a fresh SAML login.
-    If only a fresh login works, redirect to `/logout` (with **Bypass Login
-    Page** enabled on the SAML config) instead of directly to the dashboard,
-    and test that the IdP session transparently re-authenticates the user.
+### 1.1 Viewer License Tier Trap (Cost Impact)
+- **Trap**: Granting `explore` or `develop` (or any Standard/Developer permission) to the coarse onboarding SAML group immediately promotes **every** SAML user—including unentitled users waiting for approval—out of the **Viewer** license tier.
+- **Mitigation**: Create a dedicated Permission Set containing **`access_data` ONLY**, bound to a Model Set containing only the empty `provisioning_landing` model (`lookml/provisioning_landing.model.lkml`). Verify during Phase 0 that `sdk.me('id,group_ids')` works under this minimal role.
 
-## 2. Licensing pitfall: coarse SAML role permissions
+### 1.2 SAML Mirroring + Advanced Role Management Trap (Silent Wipe)
+- **Trap**: If **Mirror SAML Groups** is enabled in Looker Admin -> Authentication -> SAML, enabling either of these toggles causes Looker to **strip API-assigned groups on the user's next SAML login**:
+  - *Prevent Direct Membership in non-SAML Groups*
+  - *Prevent Role Inheritance from non-SAML Groups*
+- **Mitigation**: Leave **both toggles OFF** whenever mixing coarse SAML groups with Looker API group assignment. Always verify by logging out and logging back in twice during Phase 0.
 
-Looker classifies users into license tiers (Viewer, Standard/Creator,
-Developer) based on the **highest permission** granted across all of their
-roles.
+### 1.3 Live Session Permission Refresh (`reload` vs `spa` vs `logout`)
+- **Caveat**: Depending on Looker Core version and session cache behavior, adding a user to a group via API 4.0 may take effect on the next full page load (`reload`), immediately on SPA navigation (`spa`), or only after session re-establishment (`logout`).
+- **Mitigation**: Keep `autoRedirect: false` in `extension/src/config.js` during Phase 0 / UAT. The ready screen presents buttons for **Full Reload**, **In-App Navigation**, **New Tab**, and **Re-login (`/logout`)**. Test which option displays the target dashboard immediately, set `redirectMode` accordingly, and only then flip `autoRedirect: true`.
+  - If `logout` is required, enable **Bypass Login Page** in Looker SAML settings so `/logout` -> IdP SSO re-enters seamlessly without prompting for a password.
 
-*   Grant the coarse SAML onboarding role **only `access_data`** on a model set
-    containing **only** the empty `provisioning_landing` model.
-*   Do **not** grant `explore` or `develop` to the coarse SAML group: doing so
-    classifies every onboarded user as a Standard (Creator) or Developer
-    license, even if they are only meant to be Viewers.
-*   Verify in Stage 1 that `access_data` alone is sufficient to load the
-    extension and call `sdk.me('id')` on your Looker version.
+### 1.4 Monthly Looker Core Admin API Limits
+- Standard (1K/mo), Enterprise (10K/mo), Embed (100K/mo).
+- Keep `NO_LANDING_PAGE=true` (use group-ranked `landing_page`), nest sub-groups into persona groups, move high-cardinality RLS to BigQuery (`lookml/warehouse_rls.example.lkml`), and use the Enterprise Firestore ledger to drop repeat logins with 0 Looker API calls.
 
-## 3. Looker (Google Cloud core) monthly Admin API call allotment
+### 1.5 Testing Constraint: No `sudo` or `login_user` on Looker Core
+- Looker (Google Cloud core) restricts `sudo` and `POST /api/4.0/login/{user_id}` for standard accounts.
+- **Mitigation**: Allocate 3–5 fresh throwaway SAML accounts in your IdP for Phase 0 and UAT testing, because true Day-1 JIT user creation only occurs on an account's very first sign-in.
 
-Looker (Google Cloud core) editions document monthly Admin API call allotments:
+---
 
-| Edition | Monthly Query API calls | Monthly Admin API calls |
-| :--- | ---: | ---: |
-| Standard | 1,000 | 1,000 |
-| Enterprise | 100,000 | 10,000 |
-| Embed | 500,000 | 100,000 |
+## 2. Enterprise Control Plane Caveats
 
-User, group, and user-attribute API calls count as **Admin API calls** (logins
-do not). Your scheduled reconciliation job shares the same monthly pool.
+### 2.1 Verify Exact Cloud Logging `logName` in Phase 0
+- Looker Core environments may emit user login logs under `looker.googleapis.com%2Fuser_login` or `looker.googleapis.com%2FUserLogin`.
+- **Mitigation**: Perform one test SAML login, inspect the entry in **Cloud Logging -> Logs Explorer**, confirm the exact `logName` and `jsonPayload.actor.id` path, and set `looker_login_log_name` in `infra/enterprise/terraform.tfvars`.
 
-**Per-user cost in this PoC:**
-*   1 read (`GET /users/{id}`) + 1 call per group (`add_group_user`) + 1 call
-    per RLS user attribute (`set_user_attribute_user_value`) + 1 call for
-    `landing_page` (unless `--no-landing-page` is used).
-*   Example: 3 groups + 1 RLS attribute + `landing_page` = **6 Admin API calls
-    per new user** (60,000 calls for 10,000 users).
+### 2.2 Service Account Feedback Loop Prevention
+- Looker's login event fires for both interactive UI logins **and** API 4.0 logins (including the Worker's own `/api/4.0/login` calls).
+- **Mitigation (defense in depth)**:
+  1. Exclude the Provisioning API Service Account's numeric Looker user ID at the **Log Router Sink** (`provisioning_sa_looker_user_id`).
+  2. Pass the same ID in `EXCLUDED_ACTOR_IDS` to Cloud Run Gate (`log_parser.py`).
+  3. Worker refuses to modify any Looker user with `is_service_account == true` (`provisioner.py`).
 
-**Ways to reduce calls before rollout:**
-1.  **Use group-ranked `landing_page` instead of per-user `landing_page`
-    (`--no-landing-page`).** Assign the Dashboard Hub URL to a provisioned
-    group ranked *above* the coarse SAML group in **Admin > User Attributes >
-    landing_page > Group Values**. This saves 10,000 API calls *and* keeps the
-    hub URL centrally editable (a per-user value overrides group values
-    permanently, so changing the hub URL later would require patching 10,000
-    individual users).
-2.  **Use wrapper/profile groups.** Add each user to one composite Looker group
-    that contains their fine-grained groups (verify that folder access and
-    roles inherit as expected in your Looker setup).
-3.  **Deliver RLS attributes via SAML attribute pairings.** Looker applies SAML
-    user-attribute pairings automatically on every login (including the first)
-    with zero API calls.
-4.  **Confirm your edition and overage behavior** with your Google Cloud
-    account team before rolling out to 10,000 users.
+### 2.3 Cloud Logging Latency Expectations
+- Cloud Logging -> Log Router -> Pub/Sub -> Cloud Run Gate -> Cloud Tasks -> Worker typically completes in **2–5 seconds**, but Cloud Logging does not offer a hard `<1s` delivery SLA.
+- **Mitigation**: `extension/src/config.js` defaults `pollIntervalsMs` to `[2500, 4000, 7000, 12000, 20000]` (with +/- 15% jitter) so typical logins resolve in 1–2 checks while slow log propagation degrades gracefully up to ~45 seconds before showing a manual **Check Again** button.
 
-## 4. SAML "Mirror SAML Groups" + Advanced Role Management trap
+### 2.4 Deep Links (`https://looker.example.com/dashboards/42`)
+- When a first-time user clicks a direct link to a dashboard, Looker routes them directly to `/dashboards/42` (bypassing `landing_page`), which returns 404 / "no access" until their groups arrive.
+- **Mitigations**:
+  - In Enterprise mode, the **Cloud Logging pipeline STILL triggers on deep-link logins**, so refreshing the link 3–5 seconds later succeeds automatically.
+  - For corporate intranet / portal links, link to `/extensions/provisioning_landing::jit_onboarding?next=/dashboards/42` so first-time users see the splash screen and land straight on dashboard 42 once provisioned.
 
-If **Mirror SAML Groups** is enabled in Looker **Admin > Authentication > SAML**:
+### 2.5 Safe Delta Revocation Scope
+- Revoking groups blindly would risk stripping `All Users` or IdP-mirrored SAML groups.
+- **Mitigation**: `Provisioner` only ever removes groups whose name starts with `MANAGED_GROUP_PREFIX` (default `BI_`) or is listed in `MANAGED_GROUPS`, and unconditionally skips `All Users` (`id == "1"`) and any group with `externally_managed == true`.
 
-*   **Prevent Direct Membership in non-SAML Groups** must be **OFF**.
-*   **Prevent Role Inheritance from non-SAML Groups** must be **OFF**.
+### 2.6 Zero-PII Firestore Ledger & Drift Self-Healing
+- Firestore stores only `looker_user_id`, status, timestamps, and an opaque SHA-256 `entitlement_hash`—never emails or group names.
+- If an admin manually removes a user from a Looker group while the ledger entry is fresh (< 24 h), either run `POST /tasks/reconcile` with `{"emails": ["user@example.com"]}` or delete that user's ledger document so the next login re-provisions.
 
-If either toggle is ON (the default on instances that previously configured
-mirrored groups), Looker **strips all API-assigned group memberships or roles
-on the user's next SAML login**. Stage 0 step 7 explicitly verifies this.
+---
 
-## 5. Deep links, portals, and deprovisioning
+## 3. SMB Profile & Extension Caveats
 
-*   **Deep links skip `landing_page`.** When a first-time user opens a shared
-    dashboard URL (for example `/dashboards/42`), Looker forwards them to that
-    URL after SAML authentication rather than to `landing_page`. They will see
-    a "not found / no permission" page until provisioned.
-*   **Keep your scheduled sync job.** The landing extension only accelerates
-    first-time logins arriving at the root URL. Keep the scheduled job to cover
-    deep-link arrivals, entitlement changes, and access removal/offboarding.
+### 3.1 Private IP Looker Core Requires Enterprise Profile
+- If Looker Core is Private IP-only, Looker's `serverProxy` cannot reach external HTTPS endpoints without configuring **Private Service Connect (PSC) Southbound** (Internal TCP Proxy LB + NEG + publicly trusted TLS certificate).
+- Use the **Enterprise profile (`manifest.enterprise.lkml`, `external_api_urls: []`)** on Private IP instances to avoid PSC Southbound completely.
 
-## 6. Row-level security (RLS) and partial-failure safety
+### 3.2 `fetchProxy` vs `serverProxy` in SMB Mode
+- `transport: 'fetch'` sends requests from the **user's browser** (requires CORS `ALLOWED_ORIGINS` and cannot hold a hidden shared secret). Use for local PoC only.
+- `transport: 'server'` routes requests through Looker's backend with `createSecretKeyTag`, keeping `PROVISIONING_SHARED_SECRET` hidden in a scoped user attribute (`scoped_user_attributes` in `manifest.smb.lkml`). Required for production SMB deployments.
 
-*   The backend always writes in fail-closed order: **RLS user attributes
-    first**, **group memberships second**, **`landing_page` last**.
-*   A user is never added to a data-bearing group before their RLS attributes
-    are in place.
-*   If a run fails partway through (for example after adding groups, before
-    updating `landing_page`), the user lands on the extension again and the
-    backend inspects current attribute values to repair only what is missing.
-*   If any Looker group or user attribute named in entitlements does not exist,
-    the backend fails with HTTP 500 **before** performing any write.
+### 3.3 Spartan ("Extensions Only") Mode Warning
+- Do **not** set the coarse onboarding group to Spartan / `Extensions Only` mode unless you verify that Looker exits Spartan mode immediately upon adding the higher-priority business group. Otherwise users remain trapped inside the Extension even after provisioning.
 
-## 7. Security and identity model
+### 3.4 Multi-Replica Caching & Concurrency
+- Both SMB and Enterprise containers cache Looker group-name->ID maps and the 50-minute Looker API token in process memory. Keep `max_instances` bounded (`<= 2` SMB, `<= 4` Enterprise Worker) and rely on Cloud Tasks (`jit-onboarding-high` / `reconcile-low`) in Enterprise mode to bound global Looker API concurrency across replicas.
 
-*   **Zero trust in client identity beyond `user_id`.** The extension sends
-    only `{user_id}` from `sdk.me('id')`. The backend calls `GET /users/{id}`
-    with its own Admin API credentials to read the authoritative email (falling
-    back to `credentials_saml.email`), and derives every group, attribute, and
-    redirect solely from the entitlements store.
-*   **Production authentication for `/provision`.**
-    *   In **Stage 2 (`serverProxy`)**, enable `PROVISIONING_SHARED_SECRET` and
-        store the secret in a hidden Looker scoped user attribute
-        (`provisioning_landing_splash_backend_secret`) with **User Access:
-        None** (or View), **Hide Values: Yes**, **Domain Allowlist** restricted
-        to the backend HTTPS URL, and `scoped_user_attributes:
-        ["backend_secret"]` in `manifest.lkml`. The secret never reaches the
-        browser.
-    *   In **Stage 1 (`fetchProxy`)**, browser calls cannot hide a static
-        secret. Restrict `--allowed-origin` to the exact Looker origin, keep
-        the backend on a private network, or switch to `serverProxy` for
-        production.
-*   **Enable `--require-saml` in production** so backup Google OAuth accounts
-    or non-SAML accounts are never modified by the provisioning endpoint.
-    API-only service accounts and disabled users are always skipped.
-*   **Never enable `--debug-response` in production** (it exposes assigned
-    group/attribute names to the browser).
+---
 
-## 8. Browser, networking, and Looker Extension quirks
+## 4. Quick Troubleshooting Table
 
-| Issue | Cause | Fix |
-| :--- | :--- | :--- |
-| Extension shows "page not found" | Project not deployed to Production, model missing a valid connection, or user role lacks `access_data` on the model set | Commit and deploy to Production; check model configuration and coarse group role |
-| `fetchProxy` blocked immediately | `external_api_urls` in `manifest.lkml` does not match `backendUrl` in `extension/src/config.js` | Align both URLs, rebuild/redeploy LookML, hard-refresh Looker |
-| Browser blocks `https://` Looker -> `http://localhost:8787` | Chrome Private Network Access prompt or Safari mixed-content policy | Accept Chrome's local-network prompt (`Access-Control-Allow-Private-Network: true` is sent by `server.py`), test in Chrome/Edge, or move to Stage 2 HTTPS |
-| `serverProxy` cannot reach backend | Looker Core instance uses Private IP / PSC without egress to the backend, or backend is on `localhost` | Expose backend over HTTPS reachable from Looker (e.g., Cloud Run, or PSC producer / hybrid egress for Private IP Looker Core), or use `fetchProxy` from corporate browsers |
-| `serverProxy` returns HTTP 401 | Looker sent literal `{{provisioning_landing_splash_backend_secret}}` instead of substituting the secret | Verify: (1) `scoped_user_attributes: ["backend_secret"]` is uncommented in `manifest.lkml`, (2) user attribute name uses single underscores (`::` -> `_`), (3) **Hide Values = Yes**, (4) **Domain Allowlist** matches the backend URL, (5) Default Value matches `PROVISIONING_SHARED_SECRET` |
-| Webpack 5 build error (`process` / `buffer` not found) | `@looker/extension-sdk` references Node globals | Already wired in `extension/webpack.config.cjs` + `package.json`; run `npm install` in `extension/` |
-| Spartan mode locks users out of dashboards | Adding users to Looker's built-in `Extensions Only` group blocks all standard Looker routes | Do **not** add users to `Extensions Only`. If you want to hide Looker's nav bar on the splash screen, test `/spartan/provisioning_landing::splash` without that group |
-| Infinite redirect loop | `landing_page` or `fallbackPath` points back to `/extensions/provisioning_landing::splash` | `flow.js` blocks self-redirects and fails safely; ensure provisioned destinations are real dashboards/boards |
-| Cannot test with Looker `sudo` or `login_user` | Looker Core disables `sudo` and `POST /api/4.0/login/{user_id}` for regular users | Use fresh throwaway SAML test accounts (never an existing admin) for every test |
-
-## 9. Scaling to a 10,000-user rollout (production hardening)
-
-1.  **Rollout waves (avoid a Day-1 thundering herd).** If 1,000 users sign in at
-    9:00 AM, concurrent calls can trigger Looker `429 Too Many Requests` rate
-    limiting. Roll out in cohorts (for example 200–500 users per wave).
-    `looker_api.py` caps concurrent Looker calls (`--max-concurrency`, default
-    10) and honors `Retry-After` headers.
-2.  **Multi-replica backends (Cloud Run / Kubernetes).**
-    *   Looker API `POST /login` with one `client_id`/`client_secret` shares a
-        single active token track; avoid calling `POST /logout` from individual
-        replicas, and consider caching/sharing the token or bounding instance
-        count.
-    *   `server.py`'s in-memory cache and per-user locks are per-process.
-        `provisioner.py` handles cross-replica `409` group-add races
-        idempotently, but for high-concurrency production you should share the
-        short-lived cache (for example Redis/Memorystore) and replace
-        `entitlements.json` with your entitlements database.
-3.  **Observability.** Monitor `status`, `admin_api_calls`, `elapsed_ms`, and
-    HTTP `429`/`5xx` rates from the structured backend logs.
+| Symptom | Likely Cause | Fix |
+| --- | --- | --- |
+| Extension shows blank white iframe or console error `process is not defined` | Bundled without Webpack 5 polyfills | Ensure `extension/webpack.config.cjs` + `package.json` (`buffer`, `process`) are used and rebuild (`npm run build`). |
+| Extension redirects in a loop back to itself | User's `landing_page` or `hubPath` still points to the extension | Verify business group has higher priority than coarse SAML group, or set `hubPath: '/browse'`. `flow.js` aborts self-redirect loops cleanly. |
+| User gets provisioned on Login #1, then loses groups on Login #2 | SAML Mirroring *Prevent Direct Membership* toggle is ON | Turn OFF both *Prevent Direct Membership* and *Prevent Role Inheritance* in SAML settings. |
+| Enterprise Worker never triggers on login | Wrong `looker_login_log_name` or sink lacks `roles/pubsub.publisher` | Inspect exact `logName` in Logs Explorer; verify `terraform apply` completed IAM bindings in `infra/enterprise/iam.tf`. |
+| Pub/Sub messages pile up in Dead-Letter Topic | Gate returns 400 (unexpected log schema) or 503 (Firestore/Tasks IAM missing) | Pull 1 message from `<prefix>-user-logins-dlt-replay` and check Gate Cloud Run logs. |
+| Worker returns 503 on `/tasks/provision` | Direct VPC Egress cannot reach Looker PSC ALB or IGA API, or bad API3 creds | Check Worker logs, subnet firewall/PSC routing, and Secret Manager secret versions. |
+| User gets stuck on "Setting up your workspace" for 45 s | User has no entitlements AND `pendingMarkerGroupId` is unset | Create `BI_Access_Pending_Approval`, pass its numeric ID to `config.js` (`pendingMarkerGroupId`), and set `PENDING_MARKER_GROUP=BI_Access_Pending_Approval` on Worker. |
+| SMB `/provision` returns `401 Unauthorized` | Mismatched `PROVISIONING_SHARED_SECRET` or missing `scoped_user_attributes` | Confirm hidden Looker user attribute `<project>_<secretKeyName>` matches Secret Manager `shared-secret`. |
+| SMB `/provision` returns `403 Forbidden` | Browser `Origin` missing from `ALLOWED_ORIGINS` | Set `ALLOWED_ORIGINS` to exact Looker URL (no trailing slash) or switch to `transport: 'server'`. |

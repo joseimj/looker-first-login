@@ -1,6 +1,8 @@
-# Model of the landing extension. It defines no Explore and exposes no data:
-# it exists because access to an extension is granted through a model set.
+# Empty LookML model dedicated solely to the landing extension.
+# Defines no Explores and exposes zero business data.
 #
-# Replace the connection name with any connection that exists on the instance,
-# and allow that connection for this model in the project configuration.
+# Onboarding role for your coarse SAML group:
+#   - Permission Set: `access_data` ONLY (preserves Viewer license tier;
+#     do NOT grant `explore` or `develop` here).
+#   - Model Set: `provisioning_landing` ONLY.
 connection: "REPLACE_WITH_A_CONNECTION_NAME"

@@ -1,30 +1,27 @@
 /**
- * @fileoverview Splash screen of the landing extension (plain DOM, no
- * framework). All user-visible text lives in MESSAGES so that it can be
- * translated in one place.
+ * @fileoverview Splash screen UI (plain DOM, zero framework dependencies).
+ * All user-visible strings live in MESSAGES for straightforward localization.
  */
 
 import {State} from './flow.js';
 
-/**
- * User-visible text, keyed by language. Add a language by copying the `en`
- * block; `{n}` is replaced with the attempt number.
- */
 const MESSAGES = {
   en: {
     title: 'Preparing your workspace',
     identifying: 'Checking your account…',
-    provisioning: 'Setting up your access. This takes a few seconds…',
-    provisioningRetry: 'Still working on it (attempt {n})…',
+    provisioning: 'Setting up your access. This usually takes a few seconds…',
+    provisioningRetry: 'Still finishing setup (check {n})…',
     redirecting: 'All set. Opening your dashboards…',
     ready: 'Your access is ready.',
-    noAccess: 'Your account has no dashboards assigned yet. ' +
-        'Please contact your BI support team.',
-    failed: 'We could not finish setting up your access. ' +
+    noAccess: 'Your account has no BI dashboards assigned yet. ' +
+        'Please request access through your IT / identity portal.',
+    requestAccess: 'Request BI access',
+    failed: 'Workspace setup is taking longer than expected. ' +
         'Please try again in a moment.',
     retry: 'Try again',
     continueReload: 'Continue (page reload)',
     continueSpa: 'Continue (in-app navigation)',
+    continueLogout: 'Re-authenticate (/logout)',
     continueNewTab: 'Open in new tab',
     details: 'Details',
   },
@@ -52,28 +49,12 @@ const STYLE = `
   details pre { white-space: pre-wrap; margin: 8px 0 0; }
 `;
 
-/**
- * Picks the messages for the browser language, falling back to English.
- * @param {string=} locale
- * @return {!Object<string, string>}
- */
 function messagesFor(locale) {
   const language = String(locale || '').toLowerCase().split('-')[0];
   return MESSAGES[language] || MESSAGES.en;
 }
 
-/**
- * Builds the splash screen inside `root`.
- * @param {!HTMLElement} root
- * @param {string=} locale Preferred language, such as navigator.language.
- * @return {{
- *   setState: function(string, !Object=),
- *   log: function(string),
- *   onRetry: function(function()),
- *   onContinue: function(function(string)),
- * }}
- */
-export function createUi(root, locale) {
+export function createUi(root, locale, {accessRequestUrl = ''} = {}) {
   const text = messagesFor(locale);
   const doc = root.ownerDocument;
   const make = (tag, className) => {
@@ -103,6 +84,7 @@ export function createUi(root, locale) {
 
   let retryHandler = () => {};
   let continueHandler = () => {};
+  let requestAccessHandler = () => {};
   const startedAt = Date.now();
 
   const showActions = (buttons) => {
@@ -138,11 +120,15 @@ export function createUi(root, locale) {
           showActions([
             [text.continueReload, () => continueHandler('reload')],
             [text.continueSpa, () => continueHandler('spa')],
+            [text.continueLogout, () => continueHandler('logout')],
             [text.continueNewTab, () => continueHandler('new_tab')],
           ]);
           break;
         case State.NO_ACCESS:
           status.textContent = text.noAccess;
+          if (accessRequestUrl) {
+            showActions([[text.requestAccess, () => requestAccessHandler()]]);
+          }
           break;
         default:
           status.textContent = text.failed;
@@ -158,6 +144,9 @@ export function createUi(root, locale) {
     },
     onContinue(handler) {
       continueHandler = handler;
+    },
+    onRequestAccess(handler) {
+      requestAccessHandler = handler;
     },
   };
 }

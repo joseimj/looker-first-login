@@ -1,0 +1,9 @@
+project_id                     = "your-gcp-project-id"
+region                         = "europe-west3"
+container_image                = "europe-west3-docker.pkg.dev/your-gcp-project-id/looker-jit/backend:v1"
+looker_private_base_url        = "https://looker-internal.corp.example"
+iga_base_url                   = "https://iga-internal.corp.example/api/v1"
+vpc_network                    = "projects/your-host-project/global/networks/corp-vpc"
+vpc_subnetwork                 = "projects/your-host-project/regions/europe-west3/subnetworks/cloudrun-egress"
+provisioning_sa_looker_user_id = "1"
+kms_key_name                   = "" # Optional: projects/.../locations/europe-west3/keyRings/.../cryptoKeys/...

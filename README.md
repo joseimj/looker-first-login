@@ -1,303 +1,217 @@
-# First-Login Provisioning PoC for Looker (Google Cloud core)
+# Looker (Google Cloud core) Just-in-Time (JIT) Provisioning
 
-Looker (Google Cloud core) creates user accounts just-in-time on first login.
-When fine-grained access is managed via internal Looker groups and the Looker
-API (rather than mirroring hundreds of AD groups in SAML), first-time users can
-land on an empty home screen until a scheduled sync job assigns their groups
-and user attributes.
+End-to-end reference implementation for eliminating the blank first-login experience on **Looker (Google Cloud core)** when fine-grained BI groups and row-level security (RLS) cannot be mirrored inside corporate SAML/OIDC IdP claims.
 
-This repository provides a minimal, end-to-end **Proof of Concept (PoC)** that
-replaces that blank screen with a lightweight Looker Extension set as the
-`landing_page` of the coarse SAML onboarding group:
+One unified codebase supports **two deployment profiles** tailored to segment size, networking, and governance requirements:
+
+- **SMB / Mid-Market / Fast PoC (`smb`)**: A lightweight Looker Extension directly triggers a single Cloud Run service (`POST /provision`) that assigns Looker groups via API 4.0 and redirects the user straight to their Dashboard Hub in ~1–3 seconds.
+- **Enterprise (`enterprise` / `gate` + `worker`)**: A **3-Plane Hybrid** combining a **Zero-Egress Passive Polling Extension** (`external_api_urls: []`), a **Private Event-Driven GCP Control Plane** (`Cloud Logging -> Pub/Sub -> Cloud Run Gate + Zero-PII Firestore Ledger -> Dual Priority Cloud Tasks -> Cloud Run Worker -> Direct VPC Egress -> PSC Internal ALB -> Looker API 4.0`), and a **Warehouse-Native BigQuery RLS Data Plane**.
+
+---
+
+## Segment Selection Matrix
+
+| Criterion | SMB / Mid-Market (`smb`) | Enterprise (`enterprise`) |
+| --- | --- | --- |
+| **Target user base** | ~50 – 1,000 users | 1,000 – 50,000+ users |
+| **Looker Core networking** | Public IP (or Public + Private) | **Private IP / PSC**, VPC-SC, CMEK |
+| **Looker Extension egress** | `external_api_urls: ["https://..."]` (`fetchProxy` or `serverProxy`) | **`external_api_urls: []`** (zero external egress, zero CORS, zero PSC southbound) |
+| **Provisioning trigger** | Synchronous `POST /provision` from Extension | Cloud Logging `user_login` -> Log Router Sink -> Pub/Sub -> Cloud Run Gate -> Cloud Tasks -> Worker |
+| **Repeat-login overhead** | Short-lived in-memory replay cache | **Zero-PII Firestore Ledger** (~15 ms drop, 0 Looker API calls for repeat logins) |
+| **Burst & revocation isolation** | Single Cloud Run service + semaphore | **Dual Cloud Tasks queues** (`jit-onboarding-high` for live logins, `reconcile-low` for IGA change-feed revocations) |
+| **Entitlements source** | Local JSON file (`entitlements.example.json`) or simple DB | Enterprise IGA / HR REST API (`GET /entitlements`, `GET /changes`) |
+| **High-cardinality RLS / CLS** | Optional Looker User Attributes (low cardinality) | **BigQuery clustered security table + LookML `sql_always_where`** joined on built-in SAML `{{ _user_attributes["email"] }}` (0 Looker API calls) |
+| **Infrastructure footprint** | 1 Cloud Run service + Secret Manager | Pub/Sub (+ 7d DLT), Firestore, 2 Cloud Tasks queues, Cloud Scheduler, 2 internal Cloud Run services (Gate & Worker), Direct VPC Egress |
+| **Typical setup time** | 30–60 minutes | 1–2 days (after Phase 0 checks) |
+
+> **Upgrade path**: Start with `smb` in a dev/UAT project to validate Looker Core UX in under an hour, then switch `extension/src/config.js` from `mode: 'direct'` to `mode: 'passive_poll'` and deploy `infra/enterprise/`—no backend rewrite required.
+
+---
+
+## Repository Layout
 
 ```text
-First SAML login
-  └─► landing_page = /extensions/provisioning_landing::splash
-        │ 1. sdk.me('id')                       (identify signed-in user)
-        │ 2. POST /provision {user_id} ───────► Provisioning backend
-        │                                         a. GET /users/{id} (authoritative email)
-        │                                         b. Look up entitlements
-        │                                         c. Set RLS user attributes (fail-closed)
-        │                                         d. Add Looker groups (add_group_user)
-        │                                         e. Update landing_page (optional)
-        │ 3. {status, redirect}        ◄───────
-        └─► 4. Redirect to user's dashboards
-```
-
-> **Before deploying:** Read [docs/CAVEATS.md](docs/CAVEATS.md) for licensing
-> tier rules (`access_data` only), monthly Admin API call budgets, SAML
-> Advanced Role Management settings, and networking/security notes.
-
-## Repository layout
-
-```text
-looker_first_login_poc/
-├── README.md                                 # This runbook
-├── docs/CAVEATS.md                           # Known errors, caveats & production checklist
-├── lookml/
-│   ├── manifest.lkml                         # Looker Extension manifest & entitlements
-│   └── provisioning_landing.model.lkml       # Empty LookML model for extension access control
-├── extension/
-│   ├── package.json                          # @looker/extension-sdk + Webpack 5 build/dev scripts
-│   ├── webpack.config.cjs                    # Bundles src/ -> dist/bundle.js with Node polyfills
+looker-core-jit-provisioning/
+├── backend/                         # Zero-dependency Python 3.12+ unified backend
+│   ├── server.py                    # Multi-profile HTTP server (--profile smb|gate|worker|enterprise|all)
+│   ├── provisioner.py               # Fail-closed delta provisioner, pending marker, safe prefix revocation
+│   ├── looker_api.py                # Looker API 4.0 client (50m token TTL, semaphore, Retry-After)
+│   ├── entitlements.py              # SMB JSON file & Enterprise IGA HTTP REST adapters
+│   ├── ledger.py                    # Zero-PII InMemory & Firestore REST v1 CAS ledger
+│   ├── task_dispatcher.py           # Inline (local) & Cloud Tasks REST v2 dual-queue dispatcher
+│   ├── log_parser.py                # Pub/Sub push parser for Looker Core user_login logs
+│   ├── gcp_auth.py                  # Metadata Server OAuth2 token client
+│   ├── verify_immediacy.py          # Standalone CLI to validate Looker Core group-add behavior
+│   ├── fake_looker.py               # Local mock Looker API 4.0 server for offline demos
+│   ├── entitlements.example.json    # Example SMB entitlements mapping
+│   ├── Dockerfile                   # Single container image for both SMB and Enterprise
+│   └── test_*.py                    # Unit tests (Python stdlib unittest)
+├── extension/                       # Dual-mode Looker Extension (passive_poll & direct)
+│   ├── package.json                 # Webpack 5 + @looker/extension-sdk + polyfills
+│   ├── webpack.config.cjs           # Bundle builder + iframe-safe dev server
 │   ├── src/
-│   │   ├── config.js                         # Backend URL, transport, redirect mode, retry settings
-│   │   ├── flow.js                           # Provisioning state machine, retries, loop guard
-│   │   ├── ui.js                             # Splash screen (plain DOM, localized message table)
-│   │   └── index.js                          # Extension host bootstrap
-│   └── test/                                 # Node unit tests (no external test runner needed)
-└── backend/
-    ├── Dockerfile                            # Zero-dependency container for Stage 2 (Cloud Run)
-    ├── server.py                             # HTTP server exposing POST /provision & GET /healthz
-    ├── provisioner.py                        # Fail-closed, idempotent provisioning engine
-    ├── looker_api.py                         # Stdlib Looker API 4.0 client (token cache, retries)
-    ├── verify_immediacy.py                   # CLI tool timing how fast add_group_user takes effect
-    ├── entitlements.example.json             # Sample entitlements map (copy to entitlements.json)
-    ├── fake_looker.py                        # In-memory fake Looker API for unit tests & offline demo
-    └── test_*.py                             # Python unittest suite
+│   │   ├── config.js                # Switch between 'passive_poll' (Enterprise) and 'direct' (SMB)
+│   │   ├── flow.js                  # State machine: backoff polling, ?next= deep links, loop guard
+│   │   ├── ui.js                    # Clean splash, ready, pending/no-access & retry screens
+│   │   └── index.js                 # Extension SDK entrypoint
+│   └── test/                        # Node built-in unit tests (`node --test`)
+├── lookml/
+│   ├── manifest.enterprise.lkml     # Zero-egress manifest (external_api_urls: [])
+│   ├── manifest.smb.lkml            # Direct-trigger manifest (fetchProxy or serverProxy)
+│   ├── provisioning_landing.model.lkml  # Empty model for Viewer-tier coarse SAML role
+│   └── warehouse_rls.example.lkml   # Plane 3 LookML sql_always_where using SAML email
+├── sql/
+│   └── bigquery_rls_entitlements.sql # Plane 3 clustered BigQuery RLS table & merge template
+├── infra/
+│   ├── smb/                         # Terraform: 1 Cloud Run service + Secret Manager
+│   └── enterprise/                  # Terraform: Log Sink, Pub/Sub + DLT, Firestore, Dual Cloud Tasks,
+│                                    #            Cloud Scheduler, Internal Gate & Worker (Direct VPC)
+└── docs/
+    ├── ARCHITECTURE.md              # Deep dive: 3-plane flow, API call budget, IGA contract
+    ├── CAVEATS.md                   # Production traps, license tiers, SAML settings, troubleshooting
+    └── VALIDATION_CHECKLIST.md      # Phase 0 zero-code checks + SMB & Enterprise E2E sign-off
 ```
-
-**Prerequisites:**
-*   Backend: Python 3.9+ (standard library only, zero pip dependencies).
-*   Extension: Node.js 20+ and npm.
-*   Looker: A test Looker (Google Cloud core) instance, Admin access, and fresh
-    test accounts that have never signed in (Looker Core does not support
-    `sudo` or `login_user` for regular users).
-
-## Current verification status
-
-*   **Tested locally:** Backend (`python3 -m unittest`) and extension logic/UI
-    (`npm test`) pass unit tests against an in-memory fake Looker API and DOM
-    stand-ins.
-*   **Must be verified on your Looker instance:** Building `dist/bundle.js` via
-    `npm run build`, confirming `landing_page` fires on first SAML login, and
-    confirming whether `add_group_user` refreshes access in the current browser
-    session without re-login.
-
-## Questions this PoC answers
-
-1.  Does Looker route a brand-new SAML user to their coarse group's
-    `landing_page` on their **first** login?
-2.  Can a user whose coarse role has **only `access_data`** on the extension's
-    model load the extension and call `sdk.me('id')` (keeping them in the
-    Viewer license tier)?
-3.  After `add_group_user`, does the user's **current** browser session gain
-    access via in-app navigation, via full page reload, via a new tab, or only
-    after a fresh login?
-4.  Do API-assigned group memberships survive the user's **next** SAML login?
-5.  How many Admin API calls does onboarding one user consume?
 
 ---
 
-## Stage 0: Validate core Looker behavior with zero code (~20 min)
+## Run the Offline Demo & Tests First (No GCP or Looker Required)
 
-Run this first on a test instance to answer Questions 1, 3, and 4 before
-building any code.
+Both the **SMB** and **Enterprise** code paths run locally with zero external dependencies (Python 3.10+ and Node 20+):
 
-1.  Identify the group every new user belongs to at first login:
-    *   SAML with **Mirror SAML Groups** ON: your coarse mirrored SAML group.
-    *   SAML with **Mirror SAML Groups** OFF: a group in **New User Groups**.
-    *   Google OAuth test instance (no group mirroring): set the instance
-        default homepage (**Admin > General > Homepage**) instead of a group
-        value, and skip step 2.
-2.  In **Admin > Users > User Attributes > `landing_page` > Group Values**,
-    assign that group a recognizable page (for example `/browse/boards/<id>` or
-    an existing extension URL).
-3.  Sign in as a brand-new test user at the root URL (`https://<instance>/`) in
-    a private browser window. Record where they land (**Question 1**).
-4.  Sign in as a second brand-new user through a deep link (for example
-    `https://<instance>/dashboards/<id>`). Confirm they go to the deep link
-    rather than `landing_page` (expected Looker behavior).
-5.  Keep the first user signed in. As an admin, add them to a group that grants
-    a role and access to a restricted folder (`add_group_user` via API Explorer
-    or **Admin > Groups**).
-6.  In the user's browser, navigate to that folder in-app (without reloading),
-    then reload the page. Record which mode shows the content (**Question 3**).
-7.  Sign out and sign back in as that user. Verify on **Admin > Users** that
-    the API-added group is still present (**Question 4**). If it disappeared
-    and **Mirror SAML Groups** is ON, check **Admin > Authentication > SAML >
-    Advanced Role Management** and turn **OFF** *Prevent Direct Membership in
-    non-SAML Groups* and *Prevent Role Inheritance from non-SAML Groups*.
-
----
-
-## Stage 1: End-to-end PoC (Extension + local backend)
-
-### 1. Configure Looker
-
-1.  Create a blank LookML project named `provisioning_landing` (a bare Git
-    repository is sufficient for a PoC).
-2.  Add `lookml/manifest.lkml` and `lookml/provisioning_landing.model.lkml`.
-    Replace `REPLACE_WITH_A_CONNECTION_NAME` in the model file with any valid
-    database connection on the instance, and allow that connection for the
-    model in Project Configuration.
-3.  Create a minimal onboarding role:
-    *   **Permission Set:** `access_data` only (do **not** include `explore` or
-        `develop`, which upgrades Viewer licenses; see
-        [docs/CAVEATS.md](docs/CAVEATS.md)).
-    *   **Model Set:** `provisioning_landing` only.
-    Assign this role to your Stage 0 onboarding group (in **Manage Groups** on
-    the SAML page if mirroring is ON, or **New User Roles** if mirroring is
-    OFF).
-4.  Set `landing_page` for that onboarding group to:
-    ```text
-    /extensions/provisioning_landing::splash
-    ```
-    *(Optional test: `/spartan/provisioning_landing::splash` hides Looker's left
-    nav during the splash screen. Do **not** add users to the `Extensions Only`
-    group.)*
-5.  Create the target Looker groups, folder permissions, and RLS user
-    attributes referenced in your entitlements file (the backend does not
-    create groups).
-6.  Create an API-only Service Account with the Admin role (**Admin > Users >
-    Add Service Accounts**) and copy its `client_id` and `client_secret`.
-
-### 2. Build and deploy the extension
+### 1. Run Unit Tests
 
 ```bash
-cd extension
-npm install
-npm test
-npm run build
+# Backend unit tests (Python stdlib)
+cd backend && python3 -m unittest discover -p 'test_*.py' -v
+
+# Extension unit tests (Node built-in test runner)
+cd ../extension && node --test
 ```
 
-Upload `extension/dist/bundle.js` to the root of the `provisioning_landing`
-LookML project, commit, and **deploy to Production** (only users in Development
-Mode see undeployed changes).
+### 2. Exercise Both Profiles Locally Against `fake_looker.py`
 
-*Tip for fast iteration:* You can run `npm run develop` locally and temporarily
-swap `file: "bundle.js"` for `url: "http://localhost:8080/bundle.js"` in
-`manifest.lkml` while developing in Dev Mode.
-
-`extension/src/config.js` defaults to `autoRedirect: false` so the splash
-screen pauses after provisioning and displays three buttons (**Continue (page
-reload)**, **Continue (in-app navigation)**, **Open in new tab**) to verify
-**Question 3**. Once you know which redirect mode works on your instance, set
-`redirectMode` accordingly and switch `autoRedirect: true`, then rebuild and
-redeploy `bundle.js`.
-
-### 3. Start the backend
+Open two terminals (or run the first two commands in the background):
 
 ```bash
+# Terminal 1: Start mock Looker API 4.0 server on :9090
 cd backend
-cp entitlements.example.json entitlements.json
-# Edit entitlements.json with your test user email, Looker group names,
-# optional RLS user_attributes, and target landing_page.
+python3 fake_looker.py --port 9090
+```
 
-export LOOKER_CLIENT_ID="<service-account-client-id>"
-export LOOKER_CLIENT_SECRET="<service-account-client-secret>"
-
+```bash
+# Terminal 2: Start unified backend in '--profile all' mode on :8787
+cd backend
+LOOKER_CLIENT_ID=demo-admin-id \
+LOOKER_CLIENT_SECRET=demo-admin-secret \
+PROVISIONING_SHARED_SECRET=dev-secret \
 python3 server.py \
-  --looker-base-url "https://<your-looker-instance>" \
-  --entitlements entitlements.json \
-  --allowed-origin "https://<your-looker-instance>" \
+  --profile all \
+  --looker-base-url http://127.0.0.1:9090 \
+  --entitlements entitlements.example.json \
+  --allowed-origin http://localhost:8080 \
+  --excluded-actor-ids 1 \
+  --pending-group BI_Access_Pending_Approval \
+  --managed-group-prefix BI_ \
+  --require-saml \
   --debug-response
 ```
 
-*   Add `--dry-run` for a first pass that logs the plan without writing to
-    Looker.
-*   Add `--no-landing-page` if you use a higher-ranked group `landing_page`
-    instead of per-user `landing_page` overrides (saves 1 Admin API call per
-    user).
-*   Add `--require-saml` when testing SAML accounts to ensure non-SAML accounts
-    are skipped.
-*   Because Stage 1 uses `fetchProxy`, the browser calls
-    `http://localhost:8787/provision` directly. Run `server.py` on the same
-    machine as your browser (Chrome/Edge recommended; accept the Local Network
-    Access prompt if shown). If browser/network policies block `localhost`,
-    proceed to Stage 2.
+```bash
+# Terminal 3a — SMB Direct Trigger (POST /provision for Bob, user 102)
+curl -sS -X POST http://127.0.0.1:8787/provision \
+  -H 'Content-Type: application/json' \
+  -H 'X-Provisioning-Secret: dev-secret' \
+  -d '{"user_id":"102"}' | python3 -m json.tool
 
-### 4. PoC verification matrix
+# Terminal 3b — Enterprise Gate (POST /events/user-login, Pub/Sub push for Alice, user 101)
+MSG=$(printf '{"logName":"projects/demo/logs/looker.googleapis.com%%2Fuser_login","jsonPayload":{"eventName":"login","actor":{"id":"101","email":"alice@example.com"}}}' | base64 -w0)
+curl -sS -X POST http://127.0.0.1:8787/events/user-login \
+  -H 'Content-Type: application/json' \
+  -d "{\"message\":{\"data\":\"$MSG\",\"messageId\":\"evt-1\"}}" | python3 -m json.tool
 
-| # | Test case | Expected result | Observed |
-| :- | :--- | :--- | :--- |
-| 1 | Fresh SAML user signs in at root URL | Splash screen loads without blank screen | |
-| 2 | Coarse role has only `access_data` on `provisioning_landing` | Extension loads and `sdk.me('id')` succeeds | |
-| 3 | Backend completes provisioning | Status reaches `Your access is ready.`; backend logs `status: provisioned` | |
-| 4 | Click **Continue (in-app navigation)** | Target dashboard/folder loads with data | |
-| 5 | Second fresh user: click **Continue (page reload)** | Target dashboard/folder loads with data | |
-| 6 | Check data filtering | RLS user attributes filter rows immediately | |
-| 7 | Sign out and sign in again | Lands directly on dashboards; API groups persist | |
-| 8 | Fresh user opens deep link directly | Skips splash screen (record exact UX) | |
-| 9 | User missing from `entitlements.json` | Friendly "no dashboards assigned" message | |
-| 10 | Backend stopped / unreachable | Retries automatically, then shows **Try again** | |
-| 11 | Record `admin_api_calls` from backend log | Compare with monthly edition allotment | |
+# Repeat login for Alice (101) -> Gate drops at zero-PII ledger with action="skip_fresh" (0 Looker calls)
+curl -sS -X POST http://127.0.0.1:8787/events/user-login \
+  -H 'Content-Type: application/json' \
+  -d "{\"message\":{\"data\":\"$MSG\",\"messageId\":\"evt-2\"}}" | python3 -m json.tool
+
+# Terminal 3c — Enterprise Reconciler (POST /tasks/reconcile for unentitled Carol, user 103)
+curl -sS -X POST http://127.0.0.1:8787/tasks/reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{"emails":["carol@example.com"]}' | python3 -m json.tool
+```
 
 ---
 
-## Stage 2: Server-to-server (`serverProxy` + Cloud Run + shared secret)
+## Quick Start: SMB / Mid-Market Profile
 
-Use Stage 2 for shared testing or when moving toward production: Looker calls
-the backend server-to-server over HTTPS, eliminating browser CORS / local
-network issues and keeping a shared secret out of the browser.
+1. **Run Phase 0 checks** in [docs/VALIDATION_CHECKLIST.md](docs/VALIDATION_CHECKLIST.md) (takes ~20 minutes on your dev Looker Core instance).
+2. **Create the Viewer-tier coarse SAML role** in Looker:
+   - Model Set: `provisioning_landing` only (see `lookml/provisioning_landing.model.lkml`).
+   - Permission Set: **`access_data` ONLY** (do **not** grant `explore` or `develop`, which elevates license tier from Viewer to Standard/Developer).
+   - Map your coarse SAML group (e.g., `SAML_BI_Users`) to this role, and set group-ranked `landing_page` to `/extensions/provisioning_landing::jit_onboarding` (lowest priority rank, while business groups have higher priority pointing to your Dashboard Hub).
+3. **Build and deploy the backend**:
+   ```bash
+   # Build container and push to Artifact Registry
+   docker build -t REGION-docker.pkg.dev/PROJECT/REPO/looker-jit:latest backend/
+   docker push REGION-docker.pkg.dev/PROJECT/REPO/looker-jit:latest
 
-1.  Deploy `backend/` as an HTTPS service (for example on Cloud Run using
-    `backend/Dockerfile`), setting `LOOKER_BASE_URL`, `LOOKER_CLIENT_ID`,
-    `LOOKER_CLIENT_SECRET`, `PROVISIONING_SHARED_SECRET`, `ENTITLEMENTS_PATH`,
-    and `REQUIRE_SAML=true`. *(Note: Private IP / PSC Looker Core instances
-    require an egress route to the backend.)*
-2.  In Looker **Admin > Users > User Attributes**, create a user attribute:
-    *   **Name:** `provisioning_landing_splash_backend_secret`
-    *   **User Access:** `None` (or `View`)
-    *   **Hide Values:** `Yes`
-    *   **Domain Allowlist:** `https://<your-backend-host>/*`
-    *   **Default Value:** same string as `PROVISIONING_SHARED_SECRET`
-3.  In `lookml/manifest.lkml`:
-    *   Update `external_api_urls` to `["https://<your-backend-host>"]`
-    *   Uncomment `scoped_user_attributes: ["backend_secret"]`
-4.  In `extension/src/config.js`:
-    *   Set `backendUrl` to `'https://<your-backend-host>/provision'`
-    *   Set `transport: 'server'` and `secretKeyName: 'backend_secret'`
-5.  Rebuild (`npm run build`), upload `dist/bundle.js`, and deploy LookML to
-    Production.
-
----
-
-## Optional: Scripted API immediacy check (`verify_immediacy.py`)
-
-Complements Stage 0 step 6 by measuring how fast `add_group_user` takes effect
-at the Looker API layer. It creates a temporary API key on a throwaway test
-user, verifies no access, calls `add_group_user`, polls the probe with the
-existing API session (and a fresh login if needed), then cleans up both the
-membership and the temporary key.
-
-```bash
-cd backend
-export LOOKER_CLIENT_ID="<admin-client-id>"
-export LOOKER_CLIENT_SECRET="<admin-client-secret>"
-
-python3 verify_immediacy.py \
-  --looker-base-url "https://<your-looker-instance>" \
-  --subject-user-id "<test-user-id>" \
-  --group-id "<target-group-id>" \
-  --probe-path "/folders/<restricted-folder-id>"
-```
-
-Verdicts: `IMMEDIATE` (first probe succeeded), `DELAYED` (succeeded after a
-wait), `RELOGIN_REQUIRED` (only a fresh login had access), or `NOT_EFFECTIVE`
-(check group folder permissions and SAML Advanced Role Management settings).
+   # Deploy Cloud Run + Secret Manager
+   cd infra/smb
+   cp terraform.tfvars.example terraform.tfvars
+   # Edit terraform.tfvars, then populate the 3 Secret Manager secrets before apply
+   terraform init && terraform validate && terraform plan
+   terraform apply
+   ```
+   > Bake your real `entitlements.json` into the image or point `ENTITLEMENTS_PATH` / `IGA_BASE_URL` to your internal lookup store.
+4. **Configure and bundle the Extension**:
+   - In `extension/src/config.js`, set `mode: 'direct'`, `transport: 'server'`, `backendUrl: '<cloud_run_url>/provision'`, `secretKeyName: 'provisioning_secret'`, and keep `autoRedirect: false` until you verify which redirect mode (`reload` vs `spa` vs `logout`) refreshes permissions immediately on your instance.
+   - Run `cd extension && npm install && npm run build`, then upload `dist/bundle.js` and `lookml/manifest.smb.lkml` (renamed to `manifest.lkml`) to your LookML project.
 
 ---
 
-## Offline demo & automated tests (no Looker instance needed)
+## Quick Start: Enterprise Profile (3-Plane Hybrid)
 
-Run the automated test suites:
+1. **Run Phase 0 checks** in [docs/VALIDATION_CHECKLIST.md](docs/VALIDATION_CHECKLIST.md) to confirm:
+   - Exact `logName` emitted by Looker Core (`looker.googleapis.com%2Fuser_login` vs `looker.googleapis.com%2FUserLogin`).
+   - Numeric Looker `user_id` of your dedicated Provisioning API Service Account (`provisioning_sa_looker_user_id`) so the Log Router Sink excludes it deterministically.
+   - Group IDs for your coarse SAML group and zero-privilege `BI_Access_Pending_Approval` marker group.
+2. **Prepare Looker Core groups & SAML settings**:
+   - Create Viewer-tier coarse SAML role (`access_data` only on `provisioning_landing`), plus zero-privilege `BI_Access_Pending_Approval` group.
+   - If **Mirror SAML Groups** is enabled, ensure **Prevent Direct Membership in non-SAML Groups** and **Prevent Role Inheritance from non-SAML Groups** are **OFF** (see [docs/CAVEATS.md](docs/CAVEATS.md)).
+   - Prefix API-managed Looker groups consistently (default `BI_`) so delta revocation never touches `All Users` or IdP-mirrored groups.
+3. **Deploy Plane 2 (Private Event-Driven Control Plane)**:
+   ```bash
+   docker build -t REGION-docker.pkg.dev/PROJECT/REPO/looker-jit:latest backend/
+   docker push REGION-docker.pkg.dev/PROJECT/REPO/looker-jit:latest
 
-```bash
-cd backend && python3 -m unittest discover -p 'test_*.py'
-cd extension && npm test
-```
+   cd infra/enterprise
+   cp terraform.tfvars.example terraform.tfvars
+   # Fill project_id, looker_private_base_url (PSC Internal ALB), iga_base_url,
+   # vpc_network, vpc_subnetwork, looker_login_log_name, provisioning_sa_looker_user_id.
+   # Create Secret Manager versions for looker-client-id, looker-client-secret, iga-bearer-token.
+   terraform init && terraform validate && terraform plan
+   terraform apply
+   ```
+4. **Deploy Plane 1 (Zero-Egress Passive Polling Extension)**:
+   - In `extension/src/config.js`, keep `mode: 'passive_poll'`, set `hubPath`, `ignoredGroupIds` (`['1', '<coarse_saml_group_id>']`), `pendingMarkerGroupId`, and optional `accessRequestUrl`.
+   - Build (`cd extension && npm install && npm run build`) and deploy `dist/bundle.js` alongside `lookml/manifest.enterprise.lkml` (renamed to `manifest.lkml`, notice **`external_api_urls: []`**).
+5. **Deploy Plane 3 (Warehouse-Native BigQuery RLS)**:
+   - Provision the clustered table in `sql/bigquery_rls_entitlements.sql`, sync your IGA/HR feed into it, and attach the `sql_always_where` pattern from `lookml/warehouse_rls.example.lkml` to your production Explores.
 
-Run an offline end-to-end demo against the bundled in-memory fake Looker:
+---
 
-```bash
-cd backend
-python3 fake_looker.py --port 9999 &
-export LOOKER_CLIENT_ID=demo-admin-id LOOKER_CLIENT_SECRET=demo-admin-secret
-python3 server.py \
-  --looker-base-url http://127.0.0.1:9999 \
-  --entitlements entitlements.example.json \
-  --debug-response &
-curl -s -X POST http://127.0.0.1:8787/provision \
-  -H 'Content-Type: application/json' -d '{"user_id": "101"}'
-```
+## Documentation Index
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — End-to-end data flows, Admin API quota math, zero-PII Firestore ledger design, dual-queue sizing, and IGA REST API contract.
+- [docs/CAVEATS.md](docs/CAVEATS.md) — License tier traps, Looker Core edition API limits, SAML Mirroring flags, Private IP/PSC networking, deep-link behavior, and troubleshooting table.
+- [docs/VALIDATION_CHECKLIST.md](docs/VALIDATION_CHECKLIST.md) — Step-by-step Phase 0 verification plus SMB and Enterprise test matrices.
+
+---
+
+## Verification Scope
+
+Before rolling out to production, run these environment-specific checks in your own workstation / GCP project:
+
+- **Extension bundling**: Run `cd extension && npm install && npm run build` and confirm `dist/bundle.js` loads cleanly inside Looker Core.
+- **Terraform plan**: Run `terraform init && terraform validate && terraform plan` in `infra/smb/` or `infra/enterprise/` against your target GCP project, VPC, and KMS keys.
+- **Live Looker Core Phase 0 checks**: Execute all items in [docs/VALIDATION_CHECKLIST.md](docs/VALIDATION_CHECKLIST.md) using fresh throwaway SAML accounts (Looker Core disables `sudo` and `login_user` for standard accounts).

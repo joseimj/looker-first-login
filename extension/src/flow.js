@@ -1,14 +1,8 @@
 /**
- * @fileoverview Provisioning flow of the landing extension.
- *
- * Free of DOM access and of Looker SDK imports, so that it runs under plain
- * Node in the unit tests. The Looker objects are passed in:
- *   - `sdk`: Looker API 4.0 client of the extension (only `me` is called),
- *   - `extensionSDK`: extension host API (`fetchProxy`, `serverProxy`,
- *     `createSecretKeyTag`, `updateLocation`, `openBrowserWindow`).
+ * @fileoverview Dual-mode provisioning flow (SMB 'direct' + Enterprise
+ * 'passive_poll'). Free of DOM and Looker SDK imports for plain Node tests.
  */
 
-/** States shown by the splash screen. */
 export const State = Object.freeze({
   IDENTIFYING: 'identifying',
   PROVISIONING: 'provisioning',
@@ -18,38 +12,19 @@ export const State = Object.freeze({
   FAILED: 'failed',
 });
 
-/** Backend statuses meaning the user can be sent to their destination. */
 const DONE_STATUSES = new Set(['provisioned', 'already_provisioned']);
-
-/** Backend statuses that retrying cannot change. */
 const NO_ACCESS_STATUSES = new Set([
   'no_entitlements',
   'unknown_user',
   'disabled',
   'not_saml',
 ]);
-
-/** HTTP client/configuration errors that will not succeed on retry. */
 const NON_RETRYABLE_HTTP_STATUSES = new Set([400, 401, 403, 404, 405, 422]);
 
-/**
- * Tells whether a destination is a path on this Looker instance. The backend
- * answer crosses a network, so it is checked before the browser is sent
- * there.
- * @param {*} path
- * @return {boolean}
- */
 export function isSafeRelativePath(path) {
   return typeof path === 'string' && /^\/(?![/\\])\S*$/.test(path);
 }
 
-/**
- * Tells whether `path` points back to this extension itself, which would
- * trigger an infinite redirect loop.
- * @param {string} path
- * @param {string|undefined} extensionId e.g. 'provisioning_landing::splash'.
- * @return {boolean}
- */
 export function isSelfTarget(path, extensionId) {
   if (!extensionId || typeof path !== 'string') return false;
   const pathname = path.split(/[?#]/, 1)[0].replace(/\/+$/, '');
@@ -59,37 +34,38 @@ export function isSelfTarget(path, extensionId) {
 }
 
 /**
- * Sends the browser to a page of the Looker instance.
- * @param {!Object} extensionSDK
- * @param {string} path
- * @param {string} mode 'reload', 'spa', or 'new_tab'; see config.js.
+ * Extracts an optional `?next=/dashboards/42` parameter from an extension
+ * route string (useful when an enterprise portal wraps Looker deep links).
+ * @param {string|undefined} route
+ * @return {string|null}
  */
+export function extractNextParam(route) {
+  if (typeof route !== 'string') return null;
+  const qIndex = route.indexOf('?');
+  if (qIndex === -1) return null;
+  const params = new URLSearchParams(route.slice(qIndex + 1));
+  const next = params.get('next');
+  return isSafeRelativePath(next) ? next : null;
+}
+
 export function redirect(extensionSDK, path, mode) {
   if (mode === 'spa') {
     extensionSDK.updateLocation(path);
   } else if (mode === 'new_tab') {
     extensionSDK.openBrowserWindow(path, '_blank');
+  } else if (mode === 'logout') {
+    // With SAML Bypass Login Page enabled, /logout silently re-authenticates
+    // via the active IdP session and lands on the newly ranked landing_page.
+    extensionSDK.updateLocation('/logout', undefined, '_self');
   } else {
-    // A target makes the host open the URL as a page load in that window.
     extensionSDK.updateLocation(path, undefined, '_self');
   }
 }
 
-/**
- * @param {number} ms
- * @return {!Promise<void>}
- */
 function defaultSleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Rejects when a promise takes longer than the given time.
- * @param {!Promise<T>} promise
- * @param {number} ms
- * @return {!Promise<T>}
- * @template T
- */
 function withTimeout(promise, ms) {
   let timer;
   const timeout = new Promise((resolve, reject) => {
@@ -101,18 +77,38 @@ function withTimeout(promise, ms) {
 }
 
 /**
- * Asks the backend to provision the user.
- * @param {!Object} extensionSDK
+ * Evaluates a user's Looker group_ids in 'passive_poll' mode.
+ * @param {!Array<string|number>} groupIds
  * @param {!Object} config
- * @param {string|number} userId Looker ID of the current user.
- * @return {!Promise<{status: string, redirect: (string|null|undefined)}>}
+ * @param {!Set<string>} baselineGroupIds Initial groups observed at t=0.
+ * @return {'ready'|'no_access'|'pending'}
  */
+export function classifyGroups(groupIds, config, baselineGroupIds) {
+  const current = new Set((groupIds || []).map((g) => String(g)));
+  const pendingId = config.pendingMarkerGroupId ?
+      String(config.pendingMarkerGroupId) :
+      '';
+  if (pendingId && current.has(pendingId)) {
+    return 'no_access';
+  }
+  const explicitTargets = (config.provisionedGroupIds || []).map(String);
+  if (explicitTargets.length > 0) {
+    return explicitTargets.some((id) => current.has(id)) ? 'ready' : 'pending';
+  }
+  const ignored = new Set((config.ignoredGroupIds || []).map(String));
+  // Ready if user already holds a non-ignored group beyond baseline, OR if
+  // any brand-new non-ignored group appeared since t=0.
+  for (const id of current) {
+    if (id === pendingId || ignored.has(id)) continue;
+    if (!baselineGroupIds.has(id)) return 'ready';
+  }
+  return 'pending';
+}
+
 export async function callBackend(extensionSDK, config, userId) {
   const payload = {user_id: String(userId)};
   const viaServer = config.transport === 'server';
   if (viaServer && config.secretKeyName) {
-    // Looker replaces the tag with the user attribute value on the server:
-    // the secret itself never reaches the browser.
     payload.secret = extensionSDK.createSecretKeyTag(config.secretKeyName);
   }
   const init = {
@@ -142,23 +138,87 @@ export async function callBackend(extensionSDK, config, userId) {
 }
 
 /**
- * Runs one provisioning round: identifies the user, calls the backend (with
- * automatic retries on transient errors) and, on success, redirects or reports
- * the destination.
- *
- * @param {{
- *   sdk: !Object,
- *   extensionSDK: !Object,
- *   ui: {setState: function(string, !Object=), log: function(string)},
- *   config: !Object,
- *   sleep: (function(number): !Promise<void>|undefined),
- * }} deps
- * @return {!Promise<{state: string, target: (string|undefined),
- *     error: (!Error|undefined)}>} The state the splash screen ends in.
- *     READY and REDIRECTING carry `target`, FAILED carries `error`.
+ * Entry point supporting both Enterprise 'passive_poll' (zero external calls)
+ * and SMB 'direct' (calls POST /provision).
  */
-export async function runProvisioning(
-    {sdk, extensionSDK, ui, config, sleep = defaultSleep}) {
+export async function runProvisioning({
+  sdk,
+  extensionSDK,
+  ui,
+  config,
+  nextPath = null,
+  sleep = defaultSleep,
+  random = Math.random,
+}) {
+  if (config.mode === 'passive_poll') {
+    return runPassivePoll(
+        {sdk, extensionSDK, ui, config, nextPath, sleep, random});
+  }
+  return runDirect({sdk, extensionSDK, ui, config, nextPath, sleep});
+}
+
+async function runPassivePoll(
+    {sdk, extensionSDK, ui, config, nextPath, sleep, random}) {
+  ui.setState(State.IDENTIFYING);
+  let me;
+  try {
+    me = await sdk.ok(sdk.me('id,group_ids'));
+  } catch (error) {
+    ui.log(`Could not read the current user: ${error.message}`);
+    ui.setState(State.FAILED, {error});
+    return {state: State.FAILED, error};
+  }
+  const initialIds = (me.group_ids || []).map(String);
+  ui.log(`Signed in as Looker user ${me.id} (groups: [${initialIds.join(', ')}])`);
+
+  // Check if user is ALREADY provisioned (explicit target group present) or
+  // already marked as pending approval at t=0.
+  const emptyBaseline = new Set();
+  const explicitMode = (config.provisionedGroupIds || []).length > 0;
+  const initialCheck = classifyGroups(
+      initialIds, config, explicitMode ? emptyBaseline : new Set(initialIds));
+  if (initialCheck === 'no_access') {
+    ui.log('Pending-approval marker group already assigned');
+    ui.setState(State.NO_ACCESS);
+    return {state: State.NO_ACCESS};
+  }
+  if (initialCheck === 'ready') {
+    ui.log('Target group already present on initial check');
+    return finish(extensionSDK, ui, config, nextPath || config.hubPath);
+  }
+  // If no explicit provisionedGroupIds are set, check whether user already
+  // holds a group outside ignoredGroupIds (other than coarse onboarding).
+  const baseline = new Set(initialIds);
+  const intervals = config.pollIntervalsMs || [2500, 4000, 7000, 12000, 20000];
+
+  for (let i = 0; i < intervals.length; i++) {
+    const attempt = i + 1;
+    ui.setState(State.PROVISIONING, {attempt});
+    const jitterFactor = 0.8 + random() * 0.4;  // ±20% jitter
+    await sleep(Math.round(intervals[i] * jitterFactor));
+    try {
+      const latest = await sdk.ok(sdk.me('id,group_ids'));
+      const latestIds = (latest.group_ids || []).map(String);
+      ui.log(`Poll ${attempt}: groups=[${latestIds.join(', ')}]`);
+      const verdict = classifyGroups(latestIds, config, baseline);
+      if (verdict === 'ready') {
+        return finish(extensionSDK, ui, config, nextPath || config.hubPath);
+      }
+      if (verdict === 'no_access') {
+        ui.setState(State.NO_ACCESS);
+        return {state: State.NO_ACCESS};
+      }
+    } catch (error) {
+      ui.log(`Poll ${attempt} failed: ${error.message}`);
+    }
+  }
+  const error = new Error(
+      'Provisioning is taking longer than expected; please click Try again.');
+  ui.setState(State.FAILED, {error});
+  return {state: State.FAILED, error};
+}
+
+async function runDirect({sdk, extensionSDK, ui, config, nextPath, sleep}) {
   ui.setState(State.IDENTIFYING);
   let userId;
   try {
@@ -179,20 +239,18 @@ export async function runProvisioning(
       ui.log(`Backend answered "${result.status}" in ` +
           `${Date.now() - startedAt} ms (attempt ${attempt})`);
       if (DONE_STATUSES.has(result.status)) {
-        return finish(extensionSDK, ui, config, result.redirect);
+        return finish(
+            extensionSDK, ui, config, nextPath || result.redirect);
       }
       if (NO_ACCESS_STATUSES.has(result.status)) {
         ui.setState(State.NO_ACCESS);
         return {state: State.NO_ACCESS};
       }
-      // Anything else, such as "pending", is worth another attempt.
       lastError = new Error(`Backend status "${result.status}"`);
     } catch (error) {
       lastError = error;
       ui.log(`Attempt ${attempt} failed: ${error.message}`);
-      if (error.retryable === false) {
-        break;
-      }
+      if (error.retryable === false) break;
     }
     if (attempt < config.maxAttempts) {
       await sleep(config.retryDelayMs * attempt);
@@ -202,14 +260,6 @@ export async function runProvisioning(
   return {state: State.FAILED, error: lastError};
 }
 
-/**
- * @param {!Object} extensionSDK
- * @param {!Object} ui
- * @param {!Object} config
- * @param {*} requestedTarget Destination named by the backend.
- * @return {{state: string, target: (string|undefined),
- *     error: (!Error|undefined)}}
- */
 function finish(extensionSDK, ui, config, requestedTarget) {
   const extensionId = extensionSDK && extensionSDK.lookerHostData &&
       extensionSDK.lookerHostData.extensionId;
@@ -218,9 +268,7 @@ function finish(extensionSDK, ui, config, requestedTarget) {
       !isSelfTarget(requestedTarget, extensionId)) {
     target = requestedTarget;
   } else if (requestedTarget != null) {
-    ui.log(
-        'Ignored a destination that is unsafe or points back to this ' +
-        'extension');
+    ui.log('Ignored destination that is unsafe or points back to itself');
   }
   if (target === null && isSafeRelativePath(config.fallbackPath) &&
       !isSelfTarget(config.fallbackPath, extensionId)) {
@@ -228,8 +276,8 @@ function finish(extensionSDK, ui, config, requestedTarget) {
   }
   if (target === null) {
     const error = new Error(
-        'No safe redirect destination (target and fallback point back to ' +
-        'this extension or are invalid)');
+        'No safe redirect destination (target and fallback are invalid or ' +
+        'point back to this extension)');
     ui.log(error.message);
     ui.setState(State.FAILED, {error});
     return {state: State.FAILED, error};

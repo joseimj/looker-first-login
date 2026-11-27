@@ -1,13 +1,6 @@
-"""In-memory fake of the few Looker API 4.0 endpoints this kit calls.
+"""In-memory fake of the Looker API 4.0 endpoints used by this repository.
 
-For tests and offline demos only. It mirrors the documented request and
-response shapes of the endpoints, and lets a test choose how fast a new group
-membership becomes effective. It is NOT evidence of how a real Looker
-instance behaves: finding that out is the purpose of the proof of concept.
-
-Offline demo (seeded with two users, two groups and one restricted folder):
-
-    python3 fake_looker.py --port 9999
+For unit tests and offline demos only. Not evidence of live Looker behavior.
 """
 
 from __future__ import annotations
@@ -24,12 +17,11 @@ import urllib.parse
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 API_PREFIX = "/api/4.0"
-
 _NOT_FOUND = (404, {"message": "Not found"})
 
 
 class FakeClock:
-    """A clock that only advances when sleep() is called."""
+    """Deterministic clock advanced only by sleep()."""
 
     def __init__(self, start: float = 1000.0):
         self._now = start
@@ -45,7 +37,6 @@ class FakeClock:
 
 
 def _like_to_regex(pattern: str) -> "re.Pattern[str]":
-    """Converts a SQL LIKE pattern to an equivalent regular expression."""
     parts = []
     for char in pattern:
         if char == "%":
@@ -65,25 +56,14 @@ def _select_fields(record: Dict[str, Any], fields: Optional[str]) -> Dict[str, A
 
 
 class FakeLooker:
-    """State and request handling of the fake instance.
-
-    Attributes:
-        calls: (method, path) of every authenticated request, in order.
-        login_count: Number of successful logins.
-        fail_next: HTTP statuses to answer the next authenticated requests
-            with, consumed first in, first out.
-        retry_after_s: When set, 429 and 503 answers carry it as Retry-After.
-        membership_delay_s: Delay before a new membership grants access.
-        snapshot_groups_at_login: When True, a session keeps the groups its
-            user had at login, so new memberships need a fresh login.
-    """
+    """In-memory state & router matching documented Looker API 4.0 payloads."""
 
     def __init__(self, *, clock: Callable[[], float] = time.monotonic):
         self._clock = clock
         self._lock = threading.RLock()
         self._users: Dict[str, Dict[str, Any]] = {}
         self._admins: Set[str] = set()
-        self._groups: Dict[str, str] = {}
+        self._groups: Dict[str, Dict[str, Any]] = {}
         self._user_attributes: Dict[str, str] = {}
         self._folder_groups: Dict[str, Set[str]] = {}
         self._api_keys: Dict[str, Dict[str, str]] = {}
@@ -99,8 +79,6 @@ class FakeLooker:
         self.retry_after_s: Optional[float] = None
         self.membership_delay_s = 0.0
         self.snapshot_groups_at_login = False
-
-    # Arranging state.
 
     def add_user(
         self,
@@ -133,9 +111,15 @@ class FakeLooker:
             if admin:
                 self._admins.add(user_id)
 
-    def add_group(self, group_id: str, name: str) -> None:
+    def add_group(
+        self, group_id: str, name: str, *, externally_managed: bool = False
+    ) -> None:
         with self._lock:
-            self._groups[group_id] = name
+            self._groups[group_id] = {
+                "id": group_id,
+                "name": name,
+                "externally_managed": externally_managed,
+            }
 
     def add_user_attribute(
         self, attribute_id: str, name: str, *, hidden: bool = False
@@ -146,7 +130,6 @@ class FakeLooker:
                 self.hidden_attributes.add(attribute_id)
 
     def add_folder(self, folder_id: str, group_ids: Iterable[str]) -> None:
-        """Adds a folder readable by admins and members of the groups."""
         with self._lock:
             self._folder_groups[folder_id] = set(group_ids)
 
@@ -159,11 +142,8 @@ class FakeLooker:
             }
 
     def expire_tokens(self) -> None:
-        """Invalidates every access token issued so far."""
         with self._lock:
             self._tokens.clear()
-
-    # Inspecting state.
 
     def group_ids_of(self, user_id: str) -> List[str]:
         with self._lock:
@@ -176,11 +156,8 @@ class FakeLooker:
             )
 
     def writes(self) -> List[Tuple[str, str]]:
-        """Returns the calls that changed state, in order."""
         with self._lock:
             return [call for call in self.calls if call[0] != "GET"]
-
-    # Handling requests.
 
     def handle(
         self,
@@ -190,7 +167,6 @@ class FakeLooker:
         authorization: Optional[str],
         body: bytes,
     ) -> Tuple[int, Any]:
-        """Answers one request; path excludes the /api/4.0 prefix."""
         with self._lock:
             if (method, path) == ("POST", "/login"):
                 return self._login(body)
@@ -264,20 +240,33 @@ class FakeLooker:
             )
 
         if not is_admin:
-            # Looker answers 404, not 403, to most calls a user may not make.
             return _NOT_FOUND
+
+        if (method, path) == ("GET", "/users/search"):
+            target_email = (query.get("email") or "").strip().lower()
+            return 200, [
+                _select_fields(user, fields)
+                for user in self._users.values()
+                if not target_email
+                or (user.get("email") or "").strip().lower() == target_email
+            ]
 
         match = re.fullmatch(r"/users/([^/]+)", path)
         if match and method == "GET":
             user = self._users.get(match.group(1))
             return (200, _select_fields(user, fields)) if user else _NOT_FOUND
 
+        if (method, path) == ("GET", "/groups"):
+            return 200, [
+                _select_fields(group, fields) for group in self._groups.values()
+            ]
+
         if (method, path) == ("GET", "/groups/search"):
             pattern = _like_to_regex(query.get("name", "%"))
             return 200, [
-                _select_fields({"id": group_id, "name": name}, fields)
-                for group_id, name in self._groups.items()
-                if pattern.fullmatch(name)
+                _select_fields(group, fields)
+                for group in self._groups.values()
+                if pattern.fullmatch(group["name"])
             ]
 
         match = re.fullmatch(r"/groups/([^/]+)/users", path)
@@ -441,7 +430,7 @@ class FakeLookerServer:
         self._httpd.fake = fake  # type: ignore[attr-defined]
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,
-            kwargs={"poll_interval": 0.02},  # Keeps close() quick in tests.
+            kwargs={"poll_interval": 0.02},
             daemon=True,
         )
         self._thread.start()
@@ -460,14 +449,33 @@ class FakeLookerServer:
 
 
 def seed_demo(fake: FakeLooker) -> None:
-    """Loads the data set used by the offline demo in the README."""
-    fake.add_user("1", "admin@example.com", admin=True)
+    """Loads demo users, groups, attributes, and folder for offline testing."""
+    fake.add_user("1", "admin@example.com", admin=True, service_account=True)
     fake.add_api_key("1", "demo-admin-id", "demo-admin-secret")
-    fake.add_user("101", "alice@example.com", group_ids=["10"])
-    fake.add_user("102", "bob@example.com", group_ids=["10"])
-    fake.add_group("10", "SAML - BI Users")
-    fake.add_group("20", "Finance - EMEA")
-    fake.add_group("21", "Dashboard Hub Viewers")
+    fake.add_user(
+        "101",
+        "alice@example.com",
+        group_ids=["1", "10"],
+        saml_email="alice@example.com",
+    )
+    fake.add_user(
+        "102",
+        "bob@example.com",
+        group_ids=["1", "10"],
+        saml_email="bob@example.com",
+    )
+    fake.add_user(
+        "103",
+        "carol@example.com",
+        group_ids=["1", "10"],
+        saml_email="carol@example.com",
+    )
+    fake.add_group("1", "All Users")
+    fake.add_group("10", "SAML_BI_Users", externally_managed=True)
+    fake.add_group("20", "BI_Finance_EMEA")
+    fake.add_group("21", "BI_Dashboard_Hub")
+    fake.add_group("22", "BI_Marketing_Global")
+    fake.add_group("99", "BI_Access_Pending_Approval")
     fake.add_user_attribute("1", "landing_page")
     fake.add_user_attribute("2", "region")
     fake.add_folder("67", ["20"])

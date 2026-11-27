@@ -1,26 +1,9 @@
-"""Measures how fast a group membership added through the API takes effect.
+"""Measures how fast a group membership added through Looker API takes effect.
 
-Answers the question "does add_group_user give access immediately, or only
-after a new login?" at the API layer, as a complement to the manual check in
-the browser:
-
-1. creates a temporary API key for a test user (the subject),
-2. checks that the subject cannot read a probe resource (a folder or a
-   dashboard that only the target group can see),
-3. adds the subject to the target group with the admin credentials,
-4. polls the probe with the subject's *existing* API session, and with a
-   fresh login if that session never gets access,
-5. removes the membership and deletes the temporary API key.
-
-Example:
-
-    export LOOKER_CLIENT_ID=... LOOKER_CLIENT_SECRET=...   # admin API key
-    python3 verify_immediacy.py \
-        --looker-base-url https://example.cloud.looker.com \
-        --subject-user-id 123 --group-id 45 --probe-path /folders/67
-
-Use a throwaway test user: the script creates and deletes an API key on that
-account. Run it against a test instance.
+Creates a temporary API3 key on a throwaway test user, verifies baseline 403/404
+on a restricted folder/dashboard, calls add_group_user, polls with the existing
+API session (and a fresh login if needed), then cleans up both the membership
+and the temporary API key.
 """
 
 from __future__ import annotations
@@ -39,51 +22,34 @@ VERDICT_DELAYED = "DELAYED"
 VERDICT_RELOGIN_REQUIRED = "RELOGIN_REQUIRED"
 VERDICT_NOT_EFFECTIVE = "NOT_EFFECTIVE"
 
-# Waits between probes. Few, widening probes keep the check cheap for
-# editions with a small monthly API allotment.
 DEFAULT_POLL_DELAYS_S = (0.5, 1.0, 2.0, 4.0, 8.0, 15.0)
 
 _EXPLANATIONS = {
     VERDICT_IMMEDIATE: (
-        "The existing API session could read the probe on the first attempt "
-        "after add_group_user returned."
+        "The existing API session read the probe on the first attempt after "
+        "add_group_user returned."
     ),
     VERDICT_DELAYED: (
-        "The existing API session got access, but only after a delay. The "
-        "extension should poll or wait before redirecting."
+        "The existing API session got access after a short delay. Keep backoff "
+        "polling before redirecting."
     ),
     VERDICT_RELOGIN_REQUIRED: (
-        "The existing API session never got access, a fresh login did. "
-        "Access seems to be fixed at login: a page reload may not be enough."
+        "Only a fresh login gained access. Configure the extension with "
+        "redirectMode: 'logout' (and SAML Bypass Login Page = ON)."
     ),
     VERDICT_NOT_EFFECTIVE: (
-        "Neither the existing session nor a fresh login got access. Check "
-        "that the group really grants access to the probe, and the SAML "
-        "'Advanced Role Management' options that block membership or role "
-        "inheritance from non-mirrored groups."
+        "Neither the existing session nor a fresh login got access. Verify "
+        "group folder permissions and SAML Advanced Role Management toggles."
     ),
 }
 
 
 class PreconditionError(Exception):
-    """The instance isn't in the state the check needs to start from."""
+    """The Looker test account is not in the expected baseline state."""
 
 
 @dataclasses.dataclass(frozen=True)
 class CheckResult:
-    """Outcome of one immediacy check.
-
-    Attributes:
-        verdict: One of the VERDICT_* constants.
-        existing_session_latency_s: Time between add_group_user returning and
-            the existing session reading the probe, or None if it never did.
-        fresh_session_has_access: Whether a fresh login could read the probe;
-            None when the existing session got access (not tested).
-        add_call_duration_s: Duration of the add_group_user call.
-        probes: Number of probe calls made with the existing session after
-            the membership was added.
-    """
-
     verdict: str
     existing_session_latency_s: Optional[float]
     fresh_session_has_access: Optional[bool]
@@ -92,7 +58,6 @@ class CheckResult:
 
 
 def has_access(client: looker_api.LookerApi, probe_path: str) -> bool:
-    """Returns whether the client's user can read the probe resource."""
     try:
         client.request("GET", probe_path, query={"fields": "id"})
     except looker_api.LookerApiError as error:
@@ -115,29 +80,6 @@ def run_check(
     sleep: Callable[[float], None] = time.sleep,
     log: Callable[[str], None] = lambda message: None,
 ) -> CheckResult:
-    """Runs the check and always cleans up what it created.
-
-    Args:
-        admin: API client authenticated as a Looker admin.
-        make_client: Builds a client from (client_id, client_secret).
-        subject_user_id: Looker user ID of the test user.
-        group_id: Group that grants access to the probe.
-        probe_path: API path only members of the group can read, for example
-            "/folders/67" or "/dashboards/89".
-        poll_delays_s: Waits between successive probes.
-        keep_membership: Leave the subject in the group afterwards.
-        clock: Monotonic clock, injectable for tests.
-        sleep: Sleep function, injectable for tests.
-        log: Receives progress messages.
-
-    Returns:
-        The measured outcome.
-
-    Raises:
-        PreconditionError: If the subject is already in the group or can
-            already read the probe.
-        looker_api.LookerApiError: If a Looker API call fails.
-    """
     subject = admin.user(subject_user_id, fields="id,group_ids")
     if str(group_id) in {str(g) for g in subject.get("group_ids") or []}:
         raise PreconditionError(
@@ -154,7 +96,7 @@ def run_check(
         if has_access(existing, probe_path):
             raise PreconditionError(
                 f"User {subject_user_id} can already read {probe_path}; pick "
-                "a probe that only the target group can see."
+                "a probe only the target group can see."
             )
         log("Baseline confirmed: the subject cannot read the probe.")
 
@@ -178,7 +120,7 @@ def run_check(
 
         fresh_access = None
         if latency is None:
-            log("No access with the existing session; trying a fresh login.")
+            log("No access with existing session; trying a fresh login.")
             fresh = make_client(
                 credentials["client_id"], credentials["client_secret"]
             )
@@ -217,7 +159,6 @@ def _clean_up(
     remove_membership: bool,
     log: Callable[[str], None],
 ) -> None:
-    """Removes what the check created, reporting rather than raising."""
     if remove_membership:
         try:
             admin.delete_group_user(group_id, subject_user_id)
@@ -225,12 +166,12 @@ def _clean_up(
         except looker_api.LookerApiError as error:
             log(
                 f"WARNING: remove user {subject_user_id} from group "
-                f"{group_id} by hand: {error}"
+                f"{group_id} manually: {error}"
             )
     if credentials_id is None:
         log(
-            f"WARNING: delete the temporary API key of user "
-            f"{subject_user_id} by hand (no key ID was returned)."
+            f"WARNING: delete temporary API key of user {subject_user_id} "
+            "manually (no key ID returned)."
         )
         return
     try:
@@ -239,12 +180,11 @@ def _clean_up(
     except looker_api.LookerApiError as error:
         log(
             f"WARNING: delete API key {credentials_id} of user "
-            f"{subject_user_id} by hand: {error}"
+            f"{subject_user_id} manually: {error}"
         )
 
 
 def format_report(result: CheckResult) -> str:
-    """Renders the outcome for a human."""
     lines = [
         f"Verdict: {result.verdict}",
         _EXPLANATIONS[result.verdict],
@@ -271,15 +211,10 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument("--subject-user-id", required=True)
     parser.add_argument("--group-id", required=True)
-    parser.add_argument(
-        "--probe-path",
-        required=True,
-        help="API path only the group can read, e.g. /folders/67.",
-    )
+    parser.add_argument("--probe-path", required=True)
     parser.add_argument(
         "--poll-delays-s",
         default=",".join(str(delay) for delay in DEFAULT_POLL_DELAYS_S),
-        help="Comma-separated waits between probes, in seconds.",
     )
     parser.add_argument("--keep-membership", action="store_true")
     args = parser.parse_args(argv)
@@ -319,11 +254,8 @@ def main(argv: Sequence[str]) -> int:
             keep_membership=args.keep_membership,
             log=print,
         )
-    except PreconditionError as error:
-        print(f"Cannot start: {error}", file=sys.stderr)
-        return 2
-    except looker_api.LookerApiError as error:
-        print(f"Looker API call failed: {error}", file=sys.stderr)
+    except (PreconditionError, looker_api.LookerApiError) as error:
+        print(f"Error: {error}", file=sys.stderr)
         return 2
     print()
     print(format_report(result))

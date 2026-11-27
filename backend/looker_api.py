@@ -1,9 +1,10 @@
 """Minimal Looker API 4.0 client built on the Python standard library.
 
-Only the handful of endpoints this proof of concept needs are wrapped. The
-client logs in lazily, caches the access token, retries throttled calls and
-counts the calls it sends, so that the cost of provisioning can be compared
-with the admin API allotment of the Looker (Google Cloud core) edition in use.
+Wraps the endpoints needed by both SMB and Enterprise provisioning profiles.
+Logs in lazily, caches the access token for ~50 minutes (or uses an injected
+shared token store across Cloud Run replicas), never calls POST /logout,
+bounds in-flight concurrency, retries 429/5xx respecting Retry-After, and
+counts Admin API calls for quota tracking.
 """
 
 from __future__ import annotations
@@ -19,20 +20,14 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 API_PREFIX = "/api/4.0"
 
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
-_TOKEN_EXPIRY_MARGIN_S = 60.0
+# Looker tokens last 60 minutes; refresh 10 minutes early (50m effective TTL).
+_TOKEN_EXPIRY_MARGIN_S = 600.0
 _MAX_RETRY_DELAY_S = 30.0
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
 class LookerApiError(Exception):
-    """A Looker API call failed or returned an unexpected HTTP status.
-
-    Attributes:
-        method: HTTP method of the failed call.
-        path: API path of the failed call, without the /api/4.0 prefix.
-        status: HTTP status, or 0 when no HTTP response was received.
-        body: Response body, or the transport error message.
-    """
+    """A Looker API call failed or returned an unexpected HTTP status."""
 
     def __init__(self, method: str, path: str, status: int, body: str):
         super().__init__(f"{method} {path} -> HTTP {status}: {body[:300]}")
@@ -47,7 +42,7 @@ def _quote(value: Any) -> str:
 
 
 class LookerApi:
-    """Thread-safe Looker API client for one set of API credentials."""
+    """Thread-safe Looker API 4.0 client for one set of API3 credentials."""
 
     def __init__(
         self,
@@ -61,24 +56,6 @@ class LookerApi:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ):
-        """Initializes the client. No network call is made until first use.
-
-        Args:
-            base_url: Instance URL, for example https://example.cloud.looker.com.
-            client_id: API key client_id.
-            client_secret: API key client_secret.
-            timeout_s: Socket timeout of each HTTP call.
-            max_retries: Retries for throttled (429) or unavailable (5xx) calls.
-            max_concurrency: Maximum simultaneous in-flight HTTP calls to Looker
-                (bounds burst pressure during rollout spikes).
-            sleep: Sleep function, injectable for tests.
-            clock: Monotonic clock, injectable for tests.
-
-        Raises:
-            ValueError: If base_url isn't HTTPS (plain HTTP is accepted for
-                loopback addresses only, to allow local testing) or if
-                max_concurrency is less than 1.
-        """
         if max_concurrency < 1:
             raise ValueError(
                 f"max_concurrency must be at least 1, got {max_concurrency!r}"
@@ -125,20 +102,7 @@ class LookerApi:
         query: Optional[Mapping[str, Any]] = None,
         body: Any = None,
     ) -> Any:
-        """Calls the API and returns the decoded JSON response.
-
-        Args:
-            method: HTTP method.
-            path: Path below /api/4.0, for example "/users/12".
-            query: Optional query parameters.
-            body: Optional JSON-serializable request body.
-
-        Returns:
-            The decoded JSON payload, or None for an empty response.
-
-        Raises:
-            LookerApiError: If the call doesn't end with a 2xx status.
-        """
+        """Calls Looker API 4.0 and returns the decoded JSON response."""
         url = self._base_url + API_PREFIX + path
         if query:
             url += "?" + urllib.parse.urlencode(query)
@@ -148,7 +112,7 @@ class LookerApi:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
         elif method in ("POST", "PUT", "PATCH"):
-            data = b""  # Makes urllib send "Content-Length: 0".
+            data = b""
 
         reauthenticated = False
         attempt = 0
@@ -161,7 +125,6 @@ class LookerApi:
                 method, path, url, headers, data
             )
             if status == 401 and not reauthenticated:
-                # The cached token was revoked or expired early: log in again.
                 reauthenticated = True
                 self._invalidate_token(token)
                 continue
@@ -173,7 +136,7 @@ class LookerApi:
                 return json.loads(text) if text.strip() else None
             raise LookerApiError(method, path, status, text)
 
-    # Wrappers for the endpoints used by the proof of concept.
+    # Endpoint wrappers.
 
     def me(self, fields: str = "id,email,display_name") -> Any:
         return self.request("GET", "/user", query={"fields": fields})
@@ -183,10 +146,22 @@ class LookerApi:
             "GET", f"/users/{_quote(user_id)}", query={"fields": fields}
         )
 
+    def search_users_by_email(
+        self, email: str, fields: str = "id,email,is_disabled,group_ids"
+    ) -> List[Any]:
+        return self.request(
+            "GET", "/users/search", query={"email": email, "fields": fields}
+        )
+
+    def all_groups(self, fields: str = "id,name,externally_managed") -> List[Any]:
+        return self.request("GET", "/groups", query={"fields": fields})
+
     def search_groups_by_name(self, name: str) -> List[Any]:
         """Returns groups whose name matches (case-insensitive SQL LIKE)."""
         return self.request(
-            "GET", "/groups/search", query={"name": name, "fields": "id,name"}
+            "GET",
+            "/groups/search",
+            query={"name": name, "fields": "id,name,externally_managed"},
         )
 
     def add_group_user(self, group_id: Any, user_id: Any) -> Any:
@@ -260,13 +235,10 @@ class LookerApi:
 
     def _invalidate_token(self, token: str) -> None:
         with self._lock:
-            # Another thread may already have replaced the rejected token.
             if self._token == token:
                 self._token = None
 
     def _login_locked(self) -> None:
-        # Credentials go in the form-encoded body: passing them as query
-        # parameters is deprecated by the Looker API.
         data = urllib.parse.urlencode(
             {"client_id": self._client_id, "client_secret": self._client_secret}
         ).encode("utf-8")
@@ -313,11 +285,11 @@ class LookerApi:
 
 
 def _retry_delay_s(attempt: int, headers: Mapping[str, str]) -> float:
-    """Returns the wait before a retry, honoring Retry-After when present."""
+    """Returns wait before a retry, honoring Retry-After when present."""
     retry_after = headers.get("Retry-After") if headers else None
     if retry_after:
         try:
             return min(max(float(retry_after), 0.0), _MAX_RETRY_DELAY_S)
         except ValueError:
-            pass  # An HTTP-date Retry-After: fall back to exponential backoff.
+            pass
     return min(0.5 * (2**attempt), _MAX_RETRY_DELAY_S)

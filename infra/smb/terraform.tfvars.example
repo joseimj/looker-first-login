@@ -1,0 +1,4 @@
+project_id      = "your-gcp-project-id"
+region          = "europe-west3"
+container_image = "europe-west3-docker.pkg.dev/your-gcp-project-id/looker-jit/backend:v1"
+looker_base_url = "https://your-instance.cloud.looker.com"

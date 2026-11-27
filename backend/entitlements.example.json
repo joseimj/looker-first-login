@@ -1,14 +1,15 @@
 {
   "users": {
     "alice@example.com": {
-      "groups": ["Finance - EMEA", "Dashboard Hub Viewers"],
+      "groups": ["BI_Finance_EMEA", "BI_Dashboard_Hub"],
       "user_attributes": {"region": "EMEA"},
       "landing_page": "/dashboards/12"
     },
     "bob@example.com": {
-      "groups": ["Dashboard Hub Viewers"],
+      "groups": ["BI_Dashboard_Hub"],
       "landing_page": "/browse/boards/3"
     }
   },
-  "default": null
+  "default": null,
+  "changed_emails": []
 }
